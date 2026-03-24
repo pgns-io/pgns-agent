@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pgns-agent"
+dynamic = ["version"]
+description = "Wrap any agent function in a production-ready A2A server"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+authors = [{ name = "pgns" }]
+keywords = ["agents", "a2a", "pgns", "webhooks", "starlette"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+]
+dependencies = [
+    "pgns>=0.4",
+    "httpx>=0.28",
+    "starlette>=0.41,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[project.urls]
+Homepage = "https://pgns.io"
+Documentation = "https://docs.pgns.io/libraries/pgns-agent"
+Repository = "https://github.com/pgns-io/pgns-agent"
+
+[tool.hatch.version]
+path = "pgns_agent/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["pgns_agent"]
