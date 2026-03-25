@@ -37,10 +37,10 @@ if TYPE_CHECKING:
     from starlette.applications import Starlette
     from starlette.types import ASGIApp
 
-    from pgns.sdk.async_client import AsyncPigeonsClient
-    from pgns.sdk.models import AgentCard as SdkAgentCard
-    from pgns.sdk.models import Roost, SendResponse
-    from pgns.sdk.webhook import Webhook
+    from pgns.async_client import AsyncPigeonsClient
+    from pgns.models import AgentCard as SdkAgentCard
+    from pgns.models import Roost, SendResponse
+    from pgns.webhook import Webhook
     from pgns_agent.testing import TestClient
 
 logger = logging.getLogger("pgns_agent")
@@ -137,7 +137,7 @@ class AgentServer:
         # Late import so the SDK is only required when a key is supplied.
         if pgns_key is not None:
             try:
-                from pgns.sdk.async_client import AsyncPigeonsClient
+                from pgns.async_client import AsyncPigeonsClient
             except ImportError as exc:
                 raise RuntimeError(
                     "pgns-agent requires the 'pgns' package when pgns_key is provided. "
@@ -537,7 +537,7 @@ class AgentServer:
                 self._provisioned = True
                 return
 
-            from pgns.sdk.models import CreateAgentCard, CreateRoost
+            from pgns.models import CreateAgentCard, CreateRoost
 
             client = self._client
 
@@ -580,7 +580,7 @@ class AgentServer:
 
             # -- Step 3: initialise webhook verifier from roost secret --------
             if roost.secret:
-                from pgns.sdk.webhook import Webhook
+                from pgns.webhook import Webhook
 
                 self._webhook = Webhook(roost.secret)
                 logger.debug("HMAC verification enabled for roost %s", roost.id)
@@ -612,7 +612,7 @@ class AgentServer:
             return payload
 
         if self._webhook is None:
-            from pgns.sdk.errors import WebhookVerificationError
+            from pgns.errors import WebhookVerificationError
 
             raise WebhookVerificationError(
                 "Webhook verification is not configured — roost has no secret. "

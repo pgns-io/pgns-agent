@@ -1240,7 +1240,7 @@ class TestVerifyWebhook:
             agent = AgentServer("prod", "production", pgns_key="pk_test_abc")
 
         # Manually wire up a Webhook verifier (simulating post-provision state)
-        from pgns.sdk.webhook import Webhook
+        from pgns.webhook import Webhook
 
         agent._webhook = Webhook(secret)  # noqa: SLF001
 
@@ -1266,14 +1266,14 @@ class TestVerifyWebhook:
         assert result == payload
 
     def test_invalid_signature_raises(self) -> None:
-        from pgns.sdk.errors import WebhookVerificationError
+        from pgns.errors import WebhookVerificationError
 
         secret = "whsec_" + base64.b64encode(b"test-secret-key!").decode()
 
         with patch("pgns.sdk.async_client.AsyncPigeonsClient"):
             agent = AgentServer("prod", "production", pgns_key="pk_test_abc")
 
-        from pgns.sdk.webhook import Webhook
+        from pgns.webhook import Webhook
 
         agent._webhook = Webhook(secret)  # noqa: SLF001
 
@@ -1289,7 +1289,7 @@ class TestVerifyWebhook:
 
     def test_no_secret_raises_without_verification(self) -> None:
         """When provisioned but roost has no webhook verifier, raise an error."""
-        from pgns.sdk.errors import WebhookVerificationError
+        from pgns.errors import WebhookVerificationError
 
         with patch("pgns.sdk.async_client.AsyncPigeonsClient"):
             agent = AgentServer("prod", "production", pgns_key="pk_test_abc")

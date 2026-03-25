@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
-from pgns.sdk.errors import PigeonsError
+from pgns.errors import PigeonsError
 from pgns_agent import AgentServer, Task, TaskMetadata
 from pgns_agent._context import current_task
 
