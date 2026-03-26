@@ -898,11 +898,28 @@ class AgentServer:
             except Exception:
                 return JSONResponse({"error": "Invalid JSON body."}, status_code=400)
 
-            if not isinstance(body, dict) or "id" not in body:
+            if not isinstance(body, dict):
                 return JSONResponse(
-                    {"error": "Request body must be a JSON object with an 'id' field."},
+                    {"error": "Request body must be a JSON object."},
                     status_code=400,
                 )
+
+            # When delivered by the pgns worker, the body is the raw pigeon
+            # payload (no "id" field).  Auto-construct a Task envelope from
+            # the delivery headers so agent destinations work out of the box.
+            if "id" not in body:
+                pigeon_id = request.headers.get("x-pigeon-id")
+                if pigeon_id:
+                    metadata: dict[str, str] = {}
+                    cid_header = request.headers.get("x-correlation-id")
+                    if cid_header:
+                        metadata["correlation_id"] = cid_header
+                    body = {"id": pigeon_id, "input": body, "metadata": metadata}
+                else:
+                    return JSONResponse(
+                        {"error": "Request body must be a JSON object with an 'id' field."},
+                        status_code=400,
+                    )
 
             skill = body.get("skill") or DEFAULT_HANDLER_NAME
             matched_handler = self._handlers.get(skill)
