@@ -7,10 +7,14 @@ from __future__ import annotations
 
 __all__ = ["Task", "TaskMetadata", "TaskStatus"]
 
+import asyncio
 import dataclasses
 import enum
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from pgns_agent._artifact import ArtifactRef
 
 
 class TaskStatus(enum.StrEnum):
@@ -37,15 +41,19 @@ class _TaskControl:
     publishing and suspension machinery.  Not part of the public API.
     """
 
-    __slots__ = ("_update_status", "_request_input")
+    __slots__ = ("_update_status", "_request_input", "_store_artifact", "_get_artifact")
 
     def __init__(
         self,
         update_status: Callable[[str], Awaitable[None]],
         request_input: Callable[[str], Awaitable[Any]],
+        store_artifact: Callable[..., Awaitable[ArtifactRef]],
+        get_artifact: Callable[..., Awaitable[Any]],
     ) -> None:
         self._update_status = update_status
         self._request_input = request_input
+        self._store_artifact = store_artifact
+        self._get_artifact = get_artifact
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -118,3 +126,63 @@ class Task:
         if self._ctrl is None:
             raise RuntimeError("request_input() can only be called inside a task handler.")
         return await self._ctrl._request_input(prompt)
+
+    async def store_artifact(
+        self,
+        data: Any,
+        *,
+        media_type: str = "application/json",
+        ttl_seconds: int | None = None,
+        auto_delete: bool = False,
+    ) -> ArtifactRef:
+        """Store data as an artifact and return a reference.
+
+        The reference contains a URL and access_token that can be included
+        in pigeon payloads for other agents to retrieve the artifact.
+
+        Raises:
+            RuntimeError: If called outside a task handler.
+            ArtifactTooLargeError: If the data exceeds the plan's size limit.
+        """
+        if self._ctrl is None:
+            raise RuntimeError("store_artifact() can only be called inside a task handler.")
+        return await self._ctrl._store_artifact(
+            data, media_type=media_type, ttl_seconds=ttl_seconds, auto_delete=auto_delete
+        )
+
+    async def get_artifact(self, url: str, *, token: str | None = None) -> Any:
+        """Download and deserialize an artifact by URL.
+
+        Content is automatically deserialized based on the artifact's media type:
+        - application/json -> dict/list
+        - text/plain -> str
+        - all others -> bytes
+
+        Raises:
+            RuntimeError: If called outside a task handler.
+            ArtifactNotFoundError: If the artifact is expired, consumed, or missing.
+            ArtifactAccessError: If the token is invalid.
+        """
+        if self._ctrl is None:
+            raise RuntimeError("get_artifact() can only be called inside a task handler.")
+        return await self._ctrl._get_artifact(url, token=token)
+
+    async def get_artifacts(self, urls: list[str], *, tokens: list[str] | None = None) -> list[Any]:
+        """Concurrently download and deserialize multiple artifacts.
+
+        Convenience method for scatter/gather patterns. Uses asyncio.gather()
+        for concurrent fetch.
+
+        Raises:
+            RuntimeError: If called outside a task handler.
+            ValueError: If tokens is provided but length doesn't match urls.
+        """
+        if self._ctrl is None:
+            raise RuntimeError("get_artifacts() can only be called inside a task handler.")
+        if tokens is not None and len(tokens) != len(urls):
+            raise ValueError(f"Expected {len(urls)} tokens, got {len(tokens)}.")
+        coros = [
+            self._ctrl._get_artifact(url, token=tokens[i] if tokens else None)
+            for i, url in enumerate(urls)
+        ]
+        return list(await asyncio.gather(*coros))

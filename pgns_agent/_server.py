@@ -15,8 +15,9 @@ import inspect
 import json
 import logging
 import re
+import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
-from typing import TYPE_CHECKING, Any, overload
+from typing import TYPE_CHECKING, Any, TypedDict, overload
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
@@ -24,11 +25,14 @@ from starlette.routing import Route
 
 from pgns_agent._adapter import Adapter
 from pgns_agent._agent_card import (
+    AgentCapabilities,
     AgentCard,
     AgentCardAuthentication,
     AgentCardProvider,
+    AgentCardSecurityScheme,
     AgentCardSkill,
 )
+from pgns_agent._artifact import ArtifactStore, _ArtifactEscrow
 from pgns_agent._context import current_task, get_current_task
 from pgns_agent._state import _TERMINAL_STATUSES, TaskState
 from pgns_agent._task import Task, TaskMetadata, TaskStatus, _TaskControl
@@ -54,10 +58,21 @@ _DEFAULT_CARD_URL = "http://localhost"
 
 _FALLBACK_VERSION = "0.1.0"
 
+
+class _SkillMeta(TypedDict, total=False):
+    input_schema: dict[str, Any]
+    output_schema: dict[str, Any]
+
+
 _CID_RE = re.compile(r"[\x21-\x7E]{1,128}")
+_TASK_ID_RE = re.compile(r"[\x21-\x7E]{1,256}")
 
 # Maximum time (seconds) a handler can wait for caller input before timing out.
 _INPUT_TIMEOUT: float = 300.0
+
+# How long to remember completed/failed task IDs to prevent post-completion
+# reprocessing when delivery retries arrive after a task already finished.
+_COMPLETED_TASK_TTL = datetime.timedelta(minutes=10)
 
 
 def _safe_correlation_header(cid: str | None) -> dict[str, str] | None:
@@ -111,6 +126,10 @@ class AgentServer:
         description: str,
         *,
         version: str = "0.0.0",
+        capabilities: AgentCapabilities | None = None,
+        default_input_modes: tuple[str, ...] | None = None,
+        default_output_modes: tuple[str, ...] | None = None,
+        security_schemes: tuple[AgentCardSecurityScheme, ...] | None = None,
         authentication: AgentCardAuthentication | None = None,
         provider: AgentCardProvider | None = None,
         pgns_key: str | None = None,
@@ -119,11 +138,33 @@ class AgentServer:
         self._name = name
         self._description = description
         self._version = version
-        self._authentication = authentication
+        self._capabilities = capabilities or AgentCapabilities()
+        self._default_input_modes = default_input_modes or ("application/json",)
+        self._default_output_modes = default_output_modes or ("application/json",)
+
+        # Deprecation shim: convert authentication= to security_schemes=
+        if authentication is not None and security_schemes is None:
+            import warnings
+
+            warnings.warn(
+                "authentication= is deprecated; use security_schemes= instead",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            self._security_schemes = tuple(
+                AgentCardSecurityScheme(scheme=s, credentials=authentication.credentials)
+                for s in authentication.schemes
+            )
+            self._authentication = authentication
+        else:
+            self._security_schemes = security_schemes or ()
+            self._authentication = None  # explicit schemes win
         self._provider = provider
         self._pgns_url = pgns_url
         self._handlers: dict[str, TaskHandler] = {}
+        self._skill_meta: dict[str, _SkillMeta] = {}
         self._tasks: dict[str, TaskState] = {}
+        self._completed_tasks: dict[str, datetime.datetime] = {}
         self._pending_input: dict[str, asyncio.Future[Any]] = {}
         self._app: Starlette | None = None
         self._agent_card: SdkAgentCard | None = None
@@ -149,6 +190,11 @@ class AgentServer:
         else:
             self._client = None
             logger.debug("Running in local dev mode (no pgns_key)")
+
+        # In-memory artifact store for local dev mode.
+        # Shared across all tasks so artifacts stored by one handler
+        # can be retrieved by another (local-only).
+        self._artifact_store: ArtifactStore = ArtifactStore()
 
     # -- Public properties ----------------------------------------------------
 
@@ -238,7 +284,14 @@ class AgentServer:
         for handler_name in self._handlers:
             if handler_name == DEFAULT_HANDLER_NAME:
                 continue
-            skills.append(AgentCardSkill(id=handler_name))
+            meta = self._skill_meta.get(handler_name, {})
+            skills.append(
+                AgentCardSkill(
+                    id=handler_name,
+                    input_schema=meta.get("input_schema"),
+                    output_schema=meta.get("output_schema"),
+                )
+            )
 
         return AgentCard(
             name=self._name,
@@ -246,6 +299,10 @@ class AgentServer:
             url=url,
             version=self._version,
             skills=tuple(skills),
+            capabilities=self._capabilities,
+            default_input_modes=self._default_input_modes,
+            default_output_modes=self._default_output_modes,
+            security_schemes=self._security_schemes,
             authentication=self._authentication,
             provider=self._provider,
         )
@@ -338,16 +395,44 @@ class AgentServer:
 
     # -- @on_task decorator ---------------------------------------------------
 
+    @staticmethod
+    def _extract_schema(schema: type | None) -> dict[str, Any] | None:
+        """Extract JSON Schema from a type, with optional Pydantic support."""
+        if schema is None:
+            return None
+        if hasattr(schema, "model_json_schema"):
+            return schema.model_json_schema()
+        raise TypeError(
+            f"Unsupported schema type: {type(schema).__name__}. "
+            "Pass a Pydantic BaseModel subclass (requires pydantic)."
+        )
+
     @overload
     def on_task(self, fn: TaskHandler, /) -> TaskHandler: ...
 
     @overload
     def on_task(self, fn: str, /) -> Callable[[TaskHandler], TaskHandler]: ...
 
+    @overload
+    def on_task(self, fn: TaskHandler, /, *, schema: type, output_schema: type) -> TaskHandler: ...
+
+    @overload
+    def on_task(
+        self, fn: str, /, *, schema: type, output_schema: type
+    ) -> Callable[[TaskHandler], TaskHandler]: ...
+
+    @overload
+    def on_task(
+        self, *, schema: type, output_schema: type
+    ) -> Callable[[TaskHandler], TaskHandler]: ...
+
     def on_task(
         self,
-        fn: TaskHandler | str,
+        fn: TaskHandler | str | None = None,
         /,
+        *,
+        schema: type | None = None,
+        output_schema: type | None = None,
     ) -> TaskHandler | Callable[[TaskHandler], TaskHandler]:
         """Register an async handler for inbound tasks.
 
@@ -361,27 +446,63 @@ class AgentServer:
             # Named handler for multi-skill agents
             @agent.on_task("summarize")
             async def summarize(task): ...
+
+            # With input/output schema (requires pydantic)
+            @agent.on_task("summarize", schema=SummarizeInput, output_schema=SummarizeOutput)
+            async def summarize(task): ...
+
+            # Default handler with schema
+            @agent.on_task(schema=SummarizeInput)
+            async def handle(task): ...
+
+        Args:
+            schema: Optional Pydantic ``BaseModel`` subclass. When provided,
+                ``model_json_schema()`` is called at registration time and the
+                result is served as ``inputSchema`` on the skill in the agent card.
+            output_schema: Optional Pydantic ``BaseModel`` subclass. When provided,
+                ``model_json_schema()`` is called at registration time and the
+                result is served as ``outputSchema`` on the skill in the agent card.
         """
+        meta: _SkillMeta | None = None
+        input_json = self._extract_schema(schema)
+        output_json = self._extract_schema(output_schema)
+        if input_json is not None or output_json is not None:
+            meta = _SkillMeta()
+            if input_json is not None:
+                meta["input_schema"] = input_json
+            if output_json is not None:
+                meta["output_schema"] = output_json
+
         if callable(fn):
-            self._register_handler(DEFAULT_HANDLER_NAME, fn)
+            self._register_handler(DEFAULT_HANDLER_NAME, fn, meta=meta)
             return fn
 
-        name = fn
-        if name == DEFAULT_HANDLER_NAME:
+        # fn is a string (named skill) or None (keyword-only call)
+        name = fn if fn is not None else DEFAULT_HANDLER_NAME
+        if isinstance(fn, str) and name == DEFAULT_HANDLER_NAME:
             raise ValueError(
                 f"The name {DEFAULT_HANDLER_NAME!r} is reserved; "
                 "use the bare @agent.on_task decorator to register the default handler."
             )
 
         def _decorator(handler: TaskHandler) -> TaskHandler:
-            self._register_handler(name, handler)
+            self._register_handler(name, handler, meta=meta)
             return handler
 
         return _decorator
 
     # -- Testing --------------------------------------------------------------
 
-    def test_client(self, *, raise_server_exceptions: bool = False) -> TestClient:
+    def set_artifact_store(self, store: ArtifactStore) -> None:
+        """Replace the in-memory artifact store (for testing)."""
+        self._artifact_store = store
+
+    def test_client(
+        self,
+        *,
+        raise_server_exceptions: bool = False,
+        artifact_store: ArtifactStore | None = None,
+    ) -> TestClient:
         """Return a :class:`~pgns_agent.testing.TestClient` for unit testing.
 
         Convenience shortcut so tests can write::
@@ -392,7 +513,11 @@ class AgentServer:
         """
         from pgns_agent.testing import TestClient
 
-        return TestClient(self, raise_server_exceptions=raise_server_exceptions)
+        return TestClient(
+            self,
+            raise_server_exceptions=raise_server_exceptions,
+            artifact_store=artifact_store,
+        )
 
     # -- Adapter wiring -------------------------------------------------------
 
@@ -468,7 +593,8 @@ class AgentServer:
         exposes:
 
         * ``GET /.well-known/agent.json`` — A2A Agent Card discovery
-        * ``POST /`` — task dispatch to registered handlers
+        * ``POST /message:send`` — A2A v1.0 SendMessageRequest endpoint
+        * ``POST /`` — task dispatch via pigeon delivery protocol
         * ``GET /tasks/{task_id}/events`` — SSE stream for task status updates
 
         Handlers registered via :meth:`on_task` after the first call are still
@@ -552,6 +678,10 @@ class AgentServer:
                         url="",  # placeholder until ASGI routes are wired
                         description=self._description,
                         version=_agent_version(),
+                        capabilities=self._capabilities.to_dict(),
+                        default_input_modes=list(self._default_input_modes),
+                        default_output_modes=list(self._default_output_modes),
+                        security_schemes=[s.to_dict() for s in self._security_schemes] or None,
                     )
                 )
                 logger.info("Created agent card %s (%s)", agent_card.name, agent_card.id)
@@ -623,6 +753,15 @@ class AgentServer:
         return self._webhook.verify(body, headers)
 
     # -- Internals ------------------------------------------------------------
+
+    def _evict_task(self, task_id: str) -> None:
+        """Remove task from active state and record a tombstone for dedup."""
+        self._tasks.pop(task_id, None)
+        now = datetime.datetime.now(datetime.UTC)
+        self._completed_tasks[task_id] = now
+        # Reap expired tombstones
+        cutoff = now - _COMPLETED_TASK_TTL
+        self._completed_tasks = {k: v for k, v in self._completed_tasks.items() if v >= cutoff}
 
     async def _publish_status_update(
         self,
@@ -756,7 +895,9 @@ class AgentServer:
 
         return result
 
-    def _register_handler(self, name: str, handler: TaskHandler) -> None:
+    def _register_handler(
+        self, name: str, handler: TaskHandler, *, meta: _SkillMeta | None = None
+    ) -> None:
         if not name or not name.strip():
             raise ValueError("Handler name must be a non-empty string.")
         if name in self._handlers:
@@ -765,6 +906,8 @@ class AgentServer:
                 "Each skill name (or the default slot) can only have one handler."
             )
         self._handlers[name] = handler
+        if meta is not None:
+            self._skill_meta[name] = meta
         logger.debug("Registered task handler %r → %s", name, handler.__qualname__)
 
     _MAX_SUBSCRIBERS_PER_TASK = 32
@@ -852,7 +995,7 @@ class AgentServer:
                 TaskStatus.FAILED,
                 correlation_id=cid,
             )
-            self._tasks.pop(task.id, None)
+            self._evict_task(task.id)
             return
         except BaseException:
             state.transition(TaskStatus.FAILED)
@@ -862,7 +1005,7 @@ class AgentServer:
                 TaskStatus.FAILED,
                 correlation_id=cid,
             )
-            self._tasks.pop(task.id, None)
+            self._evict_task(task.id)
             raise
         finally:
             current_task.reset(token)
@@ -876,7 +1019,219 @@ class AgentServer:
             correlation_id=cid,
             artifact=result,
         )
-        self._tasks.pop(task.id, None)
+        self._evict_task(task.id)
+
+    async def _dispatch_task(
+        self,
+        task_id: str,
+        task_input: Any,
+        skill: str,
+        metadata_raw: dict[str, Any],
+        prefer_async: bool,
+    ) -> tuple[int, dict[str, Any]]:
+        """Core dispatch logic shared by pigeon and A2A endpoints.
+
+        Returns ``(status_code, response_body_dict)``.
+        """
+        matched_handler = self._handlers.get(skill)
+        # Fall back to the default handler when a named skill isn't found.
+        if matched_handler is None and skill != DEFAULT_HANDLER_NAME:
+            matched_handler = self._handlers.get(DEFAULT_HANDLER_NAME)
+        if matched_handler is None:
+            return 404, {"error": f"No handler registered for skill {skill!r}."}
+
+        # Validate correlation_id early — before it reaches logs or payloads.
+        cid: str | None = metadata_raw.get("correlation_id")
+        if cid is not None and not _CID_RE.fullmatch(cid):
+            logger.warning(
+                "Discarding invalid correlation_id from task %s (length=%d)",
+                task_id,
+                len(cid),
+            )
+            cid = None
+
+        # If the task is waiting for input, resume it instead of rejecting.
+        existing = self._tasks.get(task_id)
+        if existing is not None and not existing.is_terminal:
+            if existing.status is TaskStatus.INPUT_REQUIRED:
+                future = self._pending_input.pop(task_id, None)
+                if future is not None and not future.done():
+                    existing.transition(TaskStatus.WORKING)
+                    future.set_result(task_input)
+                    return 200, {"id": task_id, "status": "input-received"}
+                return 500, {
+                    "error": (
+                        f"Task {task_id!r} is in input-required state but has no pending future."
+                    )
+                }
+            logger.warning(
+                "Duplicate delivery for task %s (status=%s) — "
+                "task is still in-flight. If your handler routinely "
+                "takes >30s, increase reply_timeout_ms.",
+                task_id,
+                existing.status.value,
+            )
+            return 409, {"error": f"Task {task_id!r} is already in-flight."}
+
+        # Check tombstone cache — task may have already completed before
+        # this retry arrived.
+        completed_at = self._completed_tasks.get(task_id)
+        if completed_at is not None:
+            cutoff = datetime.datetime.now(datetime.UTC) - _COMPLETED_TASK_TTL
+            if completed_at >= cutoff:
+                logger.debug(
+                    "Retry for task %s arrived after completion "
+                    "(completed_at=%s), returning cached success.",
+                    task_id,
+                    completed_at.isoformat(),
+                )
+                return 200, {"id": task_id, "status": "completed"}
+            # Expired tombstone — clean it up and allow reprocessing
+            del self._completed_tasks[task_id]
+
+        # -- submitted -------------------------------------------------------
+        now = datetime.datetime.now(datetime.UTC)
+        state = TaskState(
+            task_id=task_id,
+            status=TaskStatus.SUBMITTED,
+            created_at=now,
+            updated_at=now,
+        )
+        self._tasks[task_id] = state
+        asyncio.create_task(
+            self._publish_status_update(
+                task_id,
+                TaskStatus.SUBMITTED,
+                correlation_id=cid,
+            )
+        )
+
+        # Build the Task object before the async/sync branch so both
+        # paths can reference it.
+        escrow = _ArtifactEscrow(
+            client=self._client,
+            task_id=task_id,
+            correlation_id=cid,
+            store=self._artifact_store,
+        )
+        ctrl = _TaskControl(
+            update_status=functools.partial(self._handle_update_status, task_id, cid),
+            request_input=functools.partial(self._handle_request_input, task_id, cid),
+            store_artifact=escrow.store_artifact,
+            get_artifact=escrow.get_artifact,
+        )
+        task = Task(
+            id=task_id,
+            input=task_input,
+            metadata=TaskMetadata(
+                correlation_id=cid,
+                source_agent=metadata_raw.get("source_agent"),
+            ),
+            _ctrl=ctrl,
+        )
+
+        # -- async mode (Prefer: respond-async, RFC 7240) -------------------
+        if prefer_async:
+            bg = asyncio.create_task(
+                self._run_async_handler(task, matched_handler, state, cid, skill)
+            )
+            self._background_tasks.add(bg)
+            bg.add_done_callback(self._background_tasks.discard)
+            return 202, {"id": task.id, "status": "submitted"}
+
+        # -- sync mode (default) --------------------------------------------
+
+        # -- working ---------------------------------------------------------
+        state.transition(TaskStatus.WORKING)
+        self._broadcast_task_event(task.id, TaskStatus.WORKING)
+        asyncio.create_task(
+            self._publish_status_update(
+                task_id,
+                TaskStatus.WORKING,
+                correlation_id=cid,
+            )
+        )
+
+        token = current_task.set(task)
+        try:
+            result = await matched_handler(task)
+        except Exception as exc:
+            # Detect rate-limit errors from upstream LLM providers and
+            # return 503 so the delivery worker backs off instead of
+            # immediately retrying (which amplifies the rate limit).
+            exc_cls = type(exc).__name__
+            is_rate_limit = "RateLimitError" in exc_cls or (
+                hasattr(exc, "status_code") and exc.status_code == 429
+            )
+            if is_rate_limit:
+                logger.warning(
+                    "Handler %r hit rate limit: %s",
+                    skill,
+                    exc,
+                )
+                retry_after = (
+                    getattr(exc, "headers", {}).get("retry-after", "60")
+                    if hasattr(exc, "headers")
+                    else "60"
+                )
+                # Clean up task state so a retry can re-create it
+                self._evict_task(task.id)
+                pending = self._pending_input.pop(task.id, None)
+                if pending is not None and not pending.done():
+                    pending.cancel()
+                return 503, {
+                    "id": task.id,
+                    "status": "rate_limited",
+                    "error": str(exc),
+                    "_retry_after": str(retry_after),
+                }
+
+            logger.exception("Handler %r raised an exception", skill)
+            # -- failed ------------------------------------------------------
+            if not state.is_terminal:
+                state.transition(TaskStatus.FAILED)
+                self._broadcast_task_event(task.id, TaskStatus.FAILED)
+                await self._publish_status_update(
+                    task.id,
+                    TaskStatus.FAILED,
+                    correlation_id=cid,
+                )
+            pending = self._pending_input.pop(task.id, None)
+            if pending is not None and not pending.done():
+                pending.cancel()
+            self._evict_task(task.id)
+            return 500, {"id": task.id, "status": "failed", "error": "Internal handler error."}
+        except BaseException:
+            # CancelledError, KeyboardInterrupt, etc. — still transition to
+            # FAILED so the state machine isn't left in WORKING, then re-raise.
+            if not state.is_terminal:
+                state.transition(TaskStatus.FAILED)
+                self._broadcast_task_event(task.id, TaskStatus.FAILED)
+                await self._publish_status_update(
+                    task.id,
+                    TaskStatus.FAILED,
+                    correlation_id=cid,
+                )
+            pending = self._pending_input.pop(task.id, None)
+            if pending is not None and not pending.done():
+                pending.cancel()
+            self._evict_task(task.id)
+            raise
+        finally:
+            current_task.reset(token)
+
+        # -- completed -------------------------------------------------------
+        state.transition(TaskStatus.COMPLETED)
+        self._broadcast_task_event(task.id, TaskStatus.COMPLETED, result=result)
+        await self._publish_status_update(
+            task.id,
+            TaskStatus.COMPLETED,
+            correlation_id=cid,
+            artifact=result,
+        )
+        # Evict terminal entry — the pigeon stream is the authoritative history.
+        self._evict_task(task.id)
+        return 200, {"id": task.id, "status": "completed", "result": result}
 
     def _build_app(self) -> Starlette:
         """Construct the Starlette ASGI application."""
@@ -921,172 +1276,140 @@ class AgentServer:
                         status_code=400,
                     )
 
-            skill = body.get("skill") or DEFAULT_HANDLER_NAME
-            matched_handler = self._handlers.get(skill)
-            # Fall back to the default handler when a named skill isn't found.
-            if matched_handler is None and skill != DEFAULT_HANDLER_NAME:
-                matched_handler = self._handlers.get(DEFAULT_HANDLER_NAME)
-            if matched_handler is None:
-                return JSONResponse(
-                    {"error": f"No handler registered for skill {skill!r}."},
-                    status_code=404,
-                )
-
-            task_id = body["id"]
+            task_id = body.get("id")
             if not isinstance(task_id, str):
                 return JSONResponse({"error": '"id" must be a string.'}, status_code=400)
+            if not _TASK_ID_RE.fullmatch(task_id):
+                return JSONResponse(
+                    {"error": '"id" must be 1-256 printable ASCII characters.'},
+                    status_code=400,
+                )
 
+            skill = body.get("skill") or DEFAULT_HANDLER_NAME
             metadata_raw = body.get("metadata")
             if not isinstance(metadata_raw, dict):
                 metadata_raw = {}
 
-            # Validate correlation_id early — before it reaches logs or payloads.
-            cid: str | None = metadata_raw.get("correlation_id")
-            if cid is not None and not _CID_RE.fullmatch(cid):
-                logger.warning(
-                    "Discarding invalid correlation_id from task %s (length=%d)",
-                    task_id,
-                    len(cid),
-                )
-                cid = None
-
-            # If the task is waiting for input, resume it instead of rejecting.
-            existing = self._tasks.get(task_id)
-            if existing is not None and not existing.is_terminal:
-                if existing.status is TaskStatus.INPUT_REQUIRED:
-                    future = self._pending_input.pop(task_id, None)
-                    if future is not None and not future.done():
-                        existing.transition(TaskStatus.WORKING)
-                        future.set_result(body.get("input"))
-                        return JSONResponse({"id": task_id, "status": "input-received"})
-                    return JSONResponse(
-                        {
-                            "error": (
-                                f"Task {task_id!r} is in input-required state "
-                                "but has no pending future."
-                            )
-                        },
-                        status_code=500,
-                    )
-                return JSONResponse(
-                    {"error": f"Task {task_id!r} is already in-flight."},
-                    status_code=409,
-                )
-
-            # -- submitted -------------------------------------------------------
-            now = datetime.datetime.now(datetime.UTC)
-            state = TaskState(
-                task_id=task_id,
-                status=TaskStatus.SUBMITTED,
-                created_at=now,
-                updated_at=now,
-            )
-            self._tasks[task_id] = state
-            asyncio.create_task(
-                self._publish_status_update(
-                    task_id,
-                    TaskStatus.SUBMITTED,
-                    correlation_id=cid,
-                )
-            )
-
-            # Build the Task object before the async/sync branch so both
-            # paths can reference it.
-            ctrl = _TaskControl(
-                update_status=functools.partial(self._handle_update_status, task_id, cid),
-                request_input=functools.partial(self._handle_request_input, task_id, cid),
-            )
-            task = Task(
-                id=task_id,
-                input=body.get("input"),
-                metadata=TaskMetadata(
-                    correlation_id=cid,
-                    source_agent=metadata_raw.get("source_agent"),
-                ),
-                _ctrl=ctrl,
-            )
-
-            # -- async mode (Prefer: respond-async, RFC 7240) -------------------
             prefer = request.headers.get("prefer", "")
             prefer_tokens = {t.strip().split(";")[0].strip() for t in prefer.split(",")}
-            if "respond-async" in prefer_tokens:
-                bg = asyncio.create_task(
-                    self._run_async_handler(task, matched_handler, state, cid, skill)
-                )
-                self._background_tasks.add(bg)
-                bg.add_done_callback(self._background_tasks.discard)
-                return JSONResponse(
-                    {"id": task.id, "status": "submitted"},
-                    status_code=202,
-                    headers={"Preference-Applied": "respond-async"},
-                )
+            prefer_async = "respond-async" in prefer_tokens
 
-            # -- sync mode (default) --------------------------------------------
-
-            # -- working ---------------------------------------------------------
-            state.transition(TaskStatus.WORKING)
-            self._broadcast_task_event(task.id, TaskStatus.WORKING)
-            asyncio.create_task(
-                self._publish_status_update(
-                    task_id,
-                    TaskStatus.WORKING,
-                    correlation_id=cid,
-                )
+            status_code, response_body = await self._dispatch_task(
+                task_id=task_id,
+                task_input=body.get("input"),
+                skill=skill,
+                metadata_raw=metadata_raw,
+                prefer_async=prefer_async,
             )
 
-            token = current_task.set(task)
+            headers: dict[str, str] = {}
+            if status_code == 202:
+                headers["Preference-Applied"] = "respond-async"
+            if status_code == 503:
+                headers["Retry-After"] = (
+                    response_body.pop("_retry_after", "60")
+                    if "_retry_after" in response_body
+                    else "60"
+                )
+
+            return JSONResponse(response_body, status_code=status_code, headers=headers or None)
+
+        async def a2a_message_endpoint(request: Request) -> JSONResponse:
+            """Accept an A2A SendMessageRequest envelope and dispatch to handler.
+
+            Parses the A2A v1.0 ``SendMessageRequest`` format, extracts text
+            content from message parts, and dispatches to the default handler
+            via :meth:`_dispatch_task`.  Returns an A2A ``Task`` response.
+
+            .. warning::
+
+                This endpoint performs no authentication or authorization.
+                It MUST be deployed behind an authenticating reverse proxy.
+                The pigeon ``POST /`` path relies on HMAC-signed delivery
+                from the pgns relay; this endpoint has no equivalent guard.
+            """
             try:
-                result = await matched_handler(task)
+                body = await request.json()
             except Exception:
-                logger.exception("Handler %r raised an exception", skill)
-                # -- failed ------------------------------------------------------
-                if not state.is_terminal:
-                    state.transition(TaskStatus.FAILED)
-                    self._broadcast_task_event(task.id, TaskStatus.FAILED)
-                    await self._publish_status_update(
-                        task.id,
-                        TaskStatus.FAILED,
-                        correlation_id=cid,
-                    )
-                pending = self._pending_input.pop(task.id, None)
-                if pending is not None and not pending.done():
-                    pending.cancel()
-                self._tasks.pop(task.id, None)
-                return JSONResponse(
-                    {"id": task.id, "status": "failed", "error": "Internal handler error."},
-                    status_code=500,
-                )
-            except BaseException:
-                # CancelledError, KeyboardInterrupt, etc. — still transition to
-                # FAILED so the state machine isn't left in WORKING, then re-raise.
-                if not state.is_terminal:
-                    state.transition(TaskStatus.FAILED)
-                    self._broadcast_task_event(task.id, TaskStatus.FAILED)
-                    await self._publish_status_update(
-                        task.id,
-                        TaskStatus.FAILED,
-                        correlation_id=cid,
-                    )
-                pending = self._pending_input.pop(task.id, None)
-                if pending is not None and not pending.done():
-                    pending.cancel()
-                self._tasks.pop(task.id, None)
-                raise
-            finally:
-                current_task.reset(token)
+                return JSONResponse({"error": "Invalid JSON body."}, status_code=400)
 
-            # -- completed -------------------------------------------------------
-            state.transition(TaskStatus.COMPLETED)
-            self._broadcast_task_event(task.id, TaskStatus.COMPLETED, result=result)
-            await self._publish_status_update(
-                task.id,
-                TaskStatus.COMPLETED,
-                correlation_id=cid,
-                artifact=result,
+            if not isinstance(body, dict):
+                return JSONResponse(
+                    {"error": "Request body must be a JSON object."}, status_code=400
+                )
+
+            # Validate A2A envelope structure.
+            message = body.get("message")
+            if not isinstance(message, dict) or "parts" not in message:
+                return JSONResponse(
+                    {"error": "Invalid A2A envelope: 'message' with 'parts' is required."},
+                    status_code=400,
+                )
+
+            parts = message.get("parts")
+            if not isinstance(parts, list) or not parts:
+                return JSONResponse(
+                    {"error": "Invalid A2A envelope: 'message.parts' must be a non-empty array."},
+                    status_code=400,
+                )
+
+            # Extract text content from parts (capped to prevent abuse).
+            _MAX_PARTS = 100
+            _MAX_TEXT_BYTES = 1_048_576  # 1 MB
+
+            text_parts: list[str] = []
+            total_size = 0
+            for part in parts[:_MAX_PARTS]:
+                if not isinstance(part, dict):
+                    continue
+                kind = part.get("kind")
+                if kind == "text":
+                    text = part.get("text")
+                    if isinstance(text, str):
+                        total_size += len(text.encode("utf-8", errors="replace"))
+                        if total_size > _MAX_TEXT_BYTES:
+                            return JSONResponse(
+                                {"error": "A2A message text exceeds 1 MB limit."},
+                                status_code=400,
+                            )
+                        text_parts.append(text)
+                    else:
+                        logger.warning(
+                            "A2A text part has non-string 'text' field (type=%s), skipping",
+                            type(text).__name__,
+                        )
+                else:
+                    logger.debug("Ignoring non-text A2A part (kind=%s)", kind)
+
+            if not text_parts:
+                return JSONResponse(
+                    {"error": "No text parts found in A2A message."},
+                    status_code=400,
+                )
+
+            extracted_text = "\n".join(text_parts) if len(text_parts) > 1 else text_parts[0]
+
+            # Determine blocking mode from configuration.
+            config = body.get("configuration") or {}
+            blocking_raw = config.get("blocking", True)
+            blocking = blocking_raw is True  # strict bool check
+
+            # Use client-supplied messageId for idempotency, fall back to uuid4.
+            message_id = message.get("messageId")
+            task_id = (
+                str(message_id) if isinstance(message_id, str) and message_id else uuid.uuid4().hex
             )
-            # Evict terminal entry — the pigeon stream is the authoritative history.
-            self._tasks.pop(task.id, None)
-            return JSONResponse({"id": task.id, "status": "completed", "result": result})
+
+            status_code, dispatch_result = await self._dispatch_task(
+                task_id=task_id,
+                task_input=extracted_text,
+                skill=DEFAULT_HANDLER_NAME,
+                metadata_raw={},
+                prefer_async=not blocking,
+            )
+
+            # Transform dispatch result into A2A Task response format.
+            return _to_a2a_response(task_id, status_code, dispatch_result)
 
         async def sse_endpoint(request: Request) -> JSONResponse | StreamingResponse:
             """Stream SSE events for a task's state transitions.
@@ -1148,6 +1471,59 @@ class AgentServer:
             routes=[
                 self.agent_card_route(),
                 Route("/tasks/{task_id}/events", sse_endpoint, methods=["GET"]),
+                Route("/message:send", a2a_message_endpoint, methods=["POST"]),
                 Route("/", task_endpoint, methods=["POST"]),
             ],
         )
+
+
+def _to_a2a_response(
+    task_id: str, status_code: int, dispatch_result: dict[str, Any]
+) -> JSONResponse:
+    """Transform an internal dispatch result into an A2A Task response.
+
+    For 503 responses, propagates the ``Retry-After`` header from the
+    dispatch result so A2A clients back off instead of retrying immediately.
+    """
+    if status_code == 200:
+        status = dispatch_result.get("status", "completed")
+        if status == "completed":
+            result = dispatch_result.get("result")
+            result_text = json.dumps(result)
+            response_body: dict[str, Any] = {
+                "id": task_id,
+                "status": {"state": "completed"},
+            }
+            if result is not None:
+                response_body["artifacts"] = [{"parts": [{"kind": "text", "text": result_text}]}]
+            return JSONResponse(response_body)
+        # Non-completed 200s (e.g. input-received, cached completed)
+        return JSONResponse(
+            {
+                "id": task_id,
+                "status": {"state": status},
+            }
+        )
+
+    if status_code == 202:
+        return JSONResponse(
+            {"id": task_id, "status": {"state": "submitted"}},
+            status_code=202,
+        )
+
+    # Error cases (400, 404, 409, 500, 503)
+    error_msg = dispatch_result.get("error", "Unknown error")
+    headers: dict[str, str] = {}
+    if status_code == 503:
+        headers["Retry-After"] = str(dispatch_result.pop("_retry_after", "60"))
+    return JSONResponse(
+        {
+            "id": task_id,
+            "status": {
+                "state": "failed",
+                "message": {"role": "agent", "parts": [{"kind": "text", "text": error_msg}]},
+            },
+        },
+        status_code=status_code,
+        headers=headers or None,
+    )

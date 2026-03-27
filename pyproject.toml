@@ -28,9 +28,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+schemas = ["pydantic>=2.0"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
+    "pydantic>=2.0",
 ]
 
 [project.urls]

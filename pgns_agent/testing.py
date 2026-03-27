@@ -16,6 +16,7 @@ from __future__ import annotations
 __all__ = ["TaskResponse", "TestClient"]
 
 import dataclasses
+import json
 import uuid
 from typing import TYPE_CHECKING, Any
 
@@ -23,6 +24,7 @@ from starlette.testclient import TestClient as StarletteTestClient
 
 if TYPE_CHECKING:
     from pgns_agent._agent_card import AgentCard
+    from pgns_agent._artifact import ArtifactStore
     from pgns_agent._server import AgentServer
     from pgns_agent._task import TaskMetadata
 
@@ -73,8 +75,11 @@ class TestClient:
         agent: AgentServer,
         *,
         raise_server_exceptions: bool = False,
+        artifact_store: ArtifactStore | None = None,
     ) -> None:
         self._agent = agent
+        if artifact_store is not None:
+            self._agent.set_artifact_store(artifact_store)
         self._http = StarletteTestClient(
             agent.app(),
             raise_server_exceptions=raise_server_exceptions,
@@ -84,6 +89,11 @@ class TestClient:
     def agent(self) -> AgentServer:
         """The :class:`AgentServer` under test."""
         return self._agent
+
+    @property
+    def artifact_store(self) -> ArtifactStore:
+        """The :class:`ArtifactStore` used by handlers in local dev mode."""
+        return self._agent._artifact_store
 
     def send_task(
         self,
@@ -143,6 +153,81 @@ class TestClient:
             id=task_id,
             status="failed",
             error=data.get("error"),
+            status_code=resp.status_code,
+        )
+
+    def send_a2a_message(
+        self,
+        text: str,
+        *,
+        blocking: bool = True,
+    ) -> TaskResponse:
+        """Send an A2A ``SendMessageRequest`` envelope to ``/message:send``.
+
+        Builds the A2A envelope, POSTs to ``/message:send``, and parses the
+        A2A response format back into a :class:`TaskResponse`.
+
+        Args:
+            text: The text content to send as a message part.
+            blocking: When ``True`` (default), the server processes the task
+                synchronously.  When ``False``, returns immediately with a
+                ``"submitted"`` status (async mode).
+        """
+        envelope: dict[str, Any] = {
+            "message": {
+                "role": "user",
+                "parts": [{"kind": "text", "text": text}],
+            },
+            "configuration": {"blocking": blocking},
+        }
+
+        resp = self._http.post("/message:send", json=envelope)
+        data = resp.json()
+
+        task_id = data.get("id", "")
+        status_obj = data.get("status", {})
+        state = status_obj.get("state", "") if isinstance(status_obj, dict) else ""
+
+        if state == "completed":
+            # Extract text from artifacts[0].parts[0].text
+            result_text: str | None = None
+            artifacts = data.get("artifacts")
+            if isinstance(artifacts, list) and artifacts:
+                parts = artifacts[0].get("parts", [])
+                if parts and isinstance(parts[0], dict):
+                    result_text = parts[0].get("text")
+            # Parse JSON result if possible.
+            result: Any = None
+            if result_text is not None:
+                try:
+                    result = json.loads(result_text)
+                except (ValueError, TypeError):
+                    result = result_text
+            return TaskResponse(
+                id=task_id,
+                status="completed",
+                result=result,
+                status_code=resp.status_code,
+            )
+
+        if state == "submitted":
+            return TaskResponse(
+                id=task_id,
+                status="submitted",
+                status_code=resp.status_code,
+            )
+
+        # Failed or other error states.
+        error: str | None = None
+        status_msg = status_obj.get("message") if isinstance(status_obj, dict) else None
+        if isinstance(status_msg, dict):
+            msg_parts = status_msg.get("parts", [])
+            if msg_parts and isinstance(msg_parts[0], dict):
+                error = msg_parts[0].get("text")
+        return TaskResponse(
+            id=task_id,
+            status="failed",
+            error=error,
             status_code=resp.status_code,
         )
 

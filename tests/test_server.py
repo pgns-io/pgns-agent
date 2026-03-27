@@ -11,6 +11,7 @@ import datetime
 import hashlib
 import hmac as hmac_mod
 import json
+import logging
 import sys
 import time
 from typing import Any
@@ -172,6 +173,51 @@ class TestOnTask:
         agent = AgentServer("a", "b")
         with pytest.raises(ValueError, match="reserved"):
             agent.on_task(DEFAULT_HANDLER_NAME)
+
+    def test_on_task_with_schema_kwarg(self) -> None:
+        from pydantic import BaseModel
+
+        class Input(BaseModel):
+            text: str
+
+        agent = AgentServer("a", "b")
+
+        @agent.on_task("summarize", schema=Input)
+        async def summarize(task: Task) -> dict[str, str]:
+            return {}
+
+        assert "summarize" in agent.handlers
+        card = agent.build_agent_card()
+        assert card.skills[0].input_schema == Input.model_json_schema()
+
+    def test_on_task_bare_decorator_with_schema(self) -> None:
+        from pydantic import BaseModel
+
+        class Input(BaseModel):
+            query: str
+
+        agent = AgentServer("a", "b")
+
+        @agent.on_task(schema=Input)
+        async def handle(task: Task) -> dict[str, str]:
+            return {}
+
+        # Default handler stored but not in card skills
+        assert DEFAULT_HANDLER_NAME in agent.handlers
+        card = agent.build_agent_card()
+        assert card.skills == ()
+        # Verify schema was stored (default handler doesn't appear in skills)
+        assert agent._skill_meta[DEFAULT_HANDLER_NAME]["input_schema"] == Input.model_json_schema()
+
+    def test_on_task_schema_none_by_default(self) -> None:
+        agent = AgentServer("a", "b")
+
+        @agent.on_task("summarize")
+        async def summarize(task: Task) -> dict[str, str]:
+            return {}
+
+        card = agent.build_agent_card()
+        assert card.skills[0].input_schema is None
 
 
 # ---------------------------------------------------------------------------
@@ -1369,7 +1415,7 @@ class TestAsyncMode:
         assert resp.status_code == 200
         assert resp.json()["result"] == {"sync": True}
 
-    def test_duplicate_inflight_task_returns_409(self) -> None:
+    def test_duplicate_inflight_task_returns_409(self, caplog: pytest.LogCaptureFixture) -> None:
         """An async task still in-flight rejects duplicates (sync or async)."""
         agent = AgentServer("a", "b")
 
@@ -1387,8 +1433,11 @@ class TestAsyncMode:
         )
 
         client = TestClient(agent.app())
-        resp = client.post("/", json={"id": "t-dup", "input": "y"})
+        with caplog.at_level(logging.WARNING, logger="pgns_agent"):
+            resp = client.post("/", json={"id": "t-dup", "input": "y"})
         assert resp.status_code == 409
+        assert "Duplicate delivery for task" in caplog.text
+        assert "(status=working)" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -1682,3 +1731,218 @@ class TestTaskEventBroadcast:
 
         event = queue.get_nowait()
         assert "result" not in event
+
+
+# ---------------------------------------------------------------------------
+# A2A /message:send endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestA2AMessageEndpoint:
+    """Tests for the ``POST /message:send`` A2A endpoint."""
+
+    def _make_agent_with_handler(self) -> tuple[AgentServer, TestClient]:
+        agent = AgentServer("a2a-test", "A2A test agent")
+
+        @agent.on_task
+        async def handle(task: Task) -> dict[str, Any]:
+            return {"echo": task.input}
+
+        return agent, TestClient(agent.app())
+
+    def test_text_message_dispatches_to_default_handler(self) -> None:
+        _, client = self._make_agent_with_handler()
+        resp = client.post(
+            "/message:send",
+            json={
+                "message": {"role": "user", "parts": [{"kind": "text", "text": "hello"}]},
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"]["state"] == "completed"
+        assert data["artifacts"][0]["parts"][0]["kind"] == "text"
+
+    def test_handler_receives_text_as_input(self) -> None:
+        agent = AgentServer("a", "b")
+        captured: dict[str, Any] = {}
+
+        @agent.on_task
+        async def handle(task: Task) -> dict[str, Any]:
+            captured["input"] = task.input
+            return {}
+
+        client = TestClient(agent.app())
+        client.post(
+            "/message:send",
+            json={"message": {"role": "user", "parts": [{"kind": "text", "text": "my input"}]}},
+        )
+        assert captured["input"] == "my input"
+
+    def test_multi_part_text_concatenated(self) -> None:
+        agent = AgentServer("a", "b")
+        captured: dict[str, Any] = {}
+
+        @agent.on_task
+        async def handle(task: Task) -> dict[str, Any]:
+            captured["input"] = task.input
+            return {}
+
+        client = TestClient(agent.app())
+        client.post(
+            "/message:send",
+            json={
+                "message": {
+                    "role": "user",
+                    "parts": [
+                        {"kind": "text", "text": "line one"},
+                        {"kind": "text", "text": "line two"},
+                    ],
+                },
+            },
+        )
+        assert captured["input"] == "line one\nline two"
+
+    def test_non_text_parts_ignored(self) -> None:
+        agent = AgentServer("a", "b")
+        captured: dict[str, Any] = {}
+
+        @agent.on_task
+        async def handle(task: Task) -> dict[str, Any]:
+            captured["input"] = task.input
+            return {}
+
+        client = TestClient(agent.app())
+        client.post(
+            "/message:send",
+            json={
+                "message": {
+                    "role": "user",
+                    "parts": [
+                        {"kind": "data", "data": {"binary": True}},
+                        {"kind": "text", "text": "only this"},
+                    ],
+                },
+            },
+        )
+        assert captured["input"] == "only this"
+
+    def test_missing_message_returns_400(self) -> None:
+        _, client = self._make_agent_with_handler()
+        resp = client.post("/message:send", json={"configuration": {}})
+        assert resp.status_code == 400
+        assert "message" in resp.json()["error"].lower()
+
+    def test_missing_parts_returns_400(self) -> None:
+        _, client = self._make_agent_with_handler()
+        resp = client.post("/message:send", json={"message": {"role": "user"}})
+        assert resp.status_code == 400
+
+    def test_empty_parts_returns_400(self) -> None:
+        _, client = self._make_agent_with_handler()
+        resp = client.post(
+            "/message:send",
+            json={"message": {"role": "user", "parts": []}},
+        )
+        assert resp.status_code == 400
+
+    def test_no_handler_returns_404(self) -> None:
+        agent = AgentServer("a", "b")
+        client = TestClient(agent.app())
+        resp = client.post(
+            "/message:send",
+            json={"message": {"role": "user", "parts": [{"kind": "text", "text": "hi"}]}},
+        )
+        assert resp.status_code == 404
+        data = resp.json()
+        assert data["status"]["state"] == "failed"
+
+    def test_handler_exception_returns_failed(self) -> None:
+        agent = AgentServer("a", "b")
+
+        @agent.on_task
+        async def handle(task: Task) -> dict[str, Any]:
+            raise RuntimeError("boom")
+
+        client = TestClient(agent.app())
+        resp = client.post(
+            "/message:send",
+            json={"message": {"role": "user", "parts": [{"kind": "text", "text": "hi"}]}},
+        )
+        assert resp.status_code == 500
+        data = resp.json()
+        assert data["status"]["state"] == "failed"
+        assert "parts" in data["status"]["message"]
+
+    def test_blocking_false_returns_submitted(self) -> None:
+        _, client = self._make_agent_with_handler()
+        resp = client.post(
+            "/message:send",
+            json={
+                "message": {"role": "user", "parts": [{"kind": "text", "text": "hi"}]},
+                "configuration": {"blocking": False},
+            },
+        )
+        assert resp.status_code == 202
+        data = resp.json()
+        assert data["status"]["state"] == "submitted"
+
+    def test_blocking_default_true(self) -> None:
+        _, client = self._make_agent_with_handler()
+        resp = client.post(
+            "/message:send",
+            json={"message": {"role": "user", "parts": [{"kind": "text", "text": "hi"}]}},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"]["state"] == "completed"
+
+    def test_response_format_matches_a2a_spec(self) -> None:
+        _, client = self._make_agent_with_handler()
+        resp = client.post(
+            "/message:send",
+            json={"message": {"role": "user", "parts": [{"kind": "text", "text": "test"}]}},
+        )
+        data = resp.json()
+        # Must have id, status, artifacts
+        assert "id" in data
+        assert isinstance(data["status"], dict)
+        assert "state" in data["status"]
+        assert isinstance(data["artifacts"], list)
+        assert len(data["artifacts"]) == 1
+        assert data["artifacts"][0]["parts"][0]["kind"] == "text"
+
+    def test_pigeon_route_still_works(self) -> None:
+        _, client = self._make_agent_with_handler()
+        resp = client.post("/", json={"id": "t-pigeon", "input": "pigeon-body"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "completed"
+        assert data["result"] == {"echo": "pigeon-body"}
+
+    def test_same_handler_both_routes(self) -> None:
+        agent = AgentServer("a", "b")
+        calls: list[str] = []
+
+        @agent.on_task
+        async def handle(task: Task) -> dict[str, Any]:
+            calls.append(task.input)
+            return {"ok": True}
+
+        client = TestClient(agent.app())
+        # Pigeon route
+        client.post("/", json={"id": "t1", "input": "pigeon"})
+        # A2A route
+        client.post(
+            "/message:send",
+            json={"message": {"role": "user", "parts": [{"kind": "text", "text": "a2a"}]}},
+        )
+        assert calls == ["pigeon", "a2a"]
+
+    def test_invalid_json_returns_400(self) -> None:
+        _, client = self._make_agent_with_handler()
+        resp = client.post(
+            "/message:send",
+            content=b"not json",
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 400

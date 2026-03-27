@@ -292,3 +292,61 @@ class TestTaskResponse:
         resp = TaskResponse(id="t1", status="completed")
         with pytest.raises(AttributeError):
             resp.status = "failed"  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# send_a2a_message
+# ---------------------------------------------------------------------------
+
+
+class TestSendA2AMessage:
+    def test_success(self) -> None:
+        agent = AgentServer("echo", "echoes input")
+
+        @agent.on_task
+        async def handle(task: Task) -> dict[str, Any]:
+            return {"echo": task.input}
+
+        client = agent.test_client()
+        resp = client.send_a2a_message("hello")
+
+        assert resp.status == "completed"
+        assert resp.result == {"echo": "hello"}
+        assert resp.status_code == 200
+        assert resp.error is None
+
+    def test_blocking_false(self) -> None:
+        agent = AgentServer("a", "b")
+
+        @agent.on_task
+        async def handle(task: Task) -> dict[str, Any]:
+            return {"done": True}
+
+        client = agent.test_client()
+        resp = client.send_a2a_message("hi", blocking=False)
+
+        assert resp.status == "submitted"
+        assert resp.status_code == 202
+
+    def test_no_handler(self) -> None:
+        agent = AgentServer("a", "b")
+        client = agent.test_client()
+        resp = client.send_a2a_message("hi")
+
+        assert resp.status == "failed"
+        assert resp.status_code == 404
+        assert resp.error is not None
+
+    def test_handler_error(self) -> None:
+        agent = AgentServer("a", "b")
+
+        @agent.on_task
+        async def handle(task: Task) -> dict[str, Any]:
+            raise RuntimeError("boom")
+
+        client = agent.test_client()
+        resp = client.send_a2a_message("hi")
+
+        assert resp.status == "failed"
+        assert resp.status_code == 500
+        assert resp.error is not None
