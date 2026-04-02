@@ -81,6 +81,34 @@ class TestTaskControlMethods:
         assert a == b
 
 
+class TestTaskTraceProperty:
+    def test_trace_returns_none_outside_handler(self) -> None:
+        task = Task(id="t", input=None)
+        assert task.trace is None
+
+    def test_trace_returns_handle_from_context_var(self) -> None:
+        from pgns_agent._context import _current_trace
+        from pgns_agent._trace import _StageHandle
+
+        handle = _StageHandle(agent_name="test")
+        token = _current_trace.set(handle)
+        try:
+            task = Task(id="t", input=None)
+            assert task.trace is handle
+        finally:
+            _current_trace.reset(token)
+
+    def test_trace_returns_none_after_reset(self) -> None:
+        from pgns_agent._context import _current_trace
+        from pgns_agent._trace import _StageHandle
+
+        handle = _StageHandle(agent_name="test")
+        token = _current_trace.set(handle)
+        _current_trace.reset(token)
+        task = Task(id="t", input=None)
+        assert task.trace is None
+
+
 class TestTaskStatus:
     def test_values(self) -> None:
         assert TaskStatus.SUBMITTED.value == "submitted"

@@ -8,6 +8,7 @@ from __future__ import annotations
 __all__ = ["AgentServer"]
 
 import asyncio
+import contextlib
 import dataclasses
 import datetime
 import functools
@@ -33,9 +34,10 @@ from pgns_agent._agent_card import (
     AgentCardSkill,
 )
 from pgns_agent._artifact import ArtifactStore, _ArtifactEscrow
-from pgns_agent._context import current_task, get_current_task
+from pgns_agent._context import _current_trace, current_task, get_current_task
 from pgns_agent._state import _TERMINAL_STATUSES, TaskState
 from pgns_agent._task import Task, TaskMetadata, TaskStatus, _TaskControl
+from pgns_agent._trace import _StageHandle
 
 if TYPE_CHECKING:
     from starlette.applications import Starlette
@@ -134,8 +136,10 @@ class AgentServer:
         provider: AgentCardProvider | None = None,
         pgns_key: str | None = None,
         pgns_url: str = DEFAULT_PGNS_URL,
+        tracing: bool = False,
     ) -> None:
         self._name = name
+        self._tracing = tracing
         self._description = description
         self._version = version
         self._capabilities = capabilities or AgentCapabilities()
@@ -217,6 +221,11 @@ class AgentServer:
     def pgns_url(self) -> str:
         """Base URL of the pgns API."""
         return self._pgns_url
+
+    @property
+    def tracing(self) -> bool:
+        """Whether automatic trace capture is enabled."""
+        return self._tracing
 
     @property
     def handlers(self) -> dict[str, TaskHandler]:
@@ -332,6 +341,7 @@ class AgentServer:
         payload: Any,
         *,
         event_type: str = "agent.task",
+        propagate_trace: bool = True,
     ) -> SendResponse:
         """Send a message to another agent's roost (inbox).
 
@@ -339,6 +349,11 @@ class AgentServer:
         delivers it via the pgns relay.  If a task is currently being handled,
         the task's ``correlation_id`` is automatically propagated via the
         ``X-Pgns-CorrelationId`` header.
+
+        When tracing is enabled and a trace context is active, the current
+        stage's trace data is automatically injected into the outbound payload
+        under the ``_trace`` key.  Downstream ``pgns-agent`` instances extract
+        this in ``_dispatch_task`` to build a full pipeline trace.
 
         .. note::
 
@@ -351,6 +366,18 @@ class AgentServer:
             target: Roost ID of the receiving agent's inbox.
             payload: JSON-serializable data to deliver.
             event_type: Event type header (default ``"agent.task"``).
+            propagate_trace: Whether to inject trace data into the outbound
+                payload.  Set to ``False`` when sending to non-pgns-agent
+                receivers that don't understand the ``_trace`` key.
+                Defaults to ``True``.
+
+                .. warning::
+
+                    When ``True``, internal operational data (agent name,
+                    timing, status) is included in the outbound payload
+                    under ``_trace``.  Always pass ``propagate_trace=False``
+                    when sending to external webhooks, third-party APIs, or
+                    any receiver outside your agent network.
 
         Returns:
             A :class:`~pgns.sdk.models.SendResponse` with the pigeon ID,
@@ -377,6 +404,22 @@ class AgentServer:
         task = get_current_task()
         cid = task.metadata.correlation_id if task is not None else None
         extra_headers = _safe_correlation_header(cid)
+
+        # Inject trace data into outbound payload when tracing is active.
+        # Idempotent: skip if _trace already present (e.g. Loft migration).
+        if (
+            propagate_trace
+            and self._tracing
+            and isinstance(payload, dict)
+            and "_trace" not in payload
+        ):
+            stage = _current_trace.get()
+            if stage is not None:
+                payload = {**payload, "_trace": [stage._to_wire()]}
+                logger.debug(
+                    "Injected trace into outbound payload for roost %r",
+                    target,
+                )
 
         logger.debug(
             "Sending to roost %r (event_type=%r, correlation_id=%s)",
@@ -754,6 +797,26 @@ class AgentServer:
 
     # -- Internals ------------------------------------------------------------
 
+    @contextlib.asynccontextmanager
+    async def _tracing_scope(self) -> AsyncIterator[_StageHandle | None]:
+        """Set up and tear down the tracing ContextVar around handler execution.
+
+        Yields the ``_StageHandle`` (or ``None`` when tracing is disabled).
+        The caller is responsible for calling ``stage._finalize(...)`` on
+        success and error paths; this context manager only manages the
+        ``_current_trace`` ContextVar lifecycle.
+        """
+        stage: _StageHandle | None = None
+        token = None
+        if self._tracing:
+            stage = _StageHandle(agent_name=self._name)
+            token = _current_trace.set(stage)
+        try:
+            yield stage
+        finally:
+            if token is not None:
+                _current_trace.reset(token)
+
     def _evict_task(self, task_id: str) -> None:
         """Remove task from active state and record a tombstone for dedup."""
         self._tasks.pop(task_id, None)
@@ -771,6 +834,8 @@ class AgentServer:
         correlation_id: str | None = None,
         message: str | None = None,
         artifact: Any = None,
+        duration_ms: float | None = None,
+        trace_error: str | None = None,
     ) -> None:
         """Publish a task-status pigeon to the agent's own roost.
 
@@ -778,6 +843,10 @@ class AgentServer:
         In production mode the pigeon is published via the SDK client.
         Publishing failures are logged but never propagated — they must not
         affect the task response.
+
+        When *duration_ms* or *trace_error* are provided, they are included
+        in the payload under their own keys — no dict merge, so existing
+        fields like ``task_id`` or ``status`` can never be overwritten.
         """
         payload: dict[str, Any] = {
             "task_id": task_id,
@@ -788,6 +857,10 @@ class AgentServer:
             payload["message"] = message
         if artifact is not None:
             payload["artifact"] = artifact
+        if duration_ms is not None:
+            payload["duration_ms"] = duration_ms
+        if trace_error is not None:
+            payload["trace_error"] = trace_error
 
         if self._client is None:
             logger.info("Task %s → %s", task_id, status.value)
@@ -983,32 +1056,45 @@ class AgentServer:
             )
         )
 
-        token = current_task.set(task)
-        try:
-            result = await handler(task)
-        except Exception:
-            logger.exception("Handler %r raised an exception (async)", skill)
-            state.transition(TaskStatus.FAILED)
-            self._broadcast_task_event(task.id, TaskStatus.FAILED)
-            await self._publish_status_update(
-                task.id,
-                TaskStatus.FAILED,
-                correlation_id=cid,
-            )
-            self._evict_task(task.id)
-            return
-        except BaseException:
-            state.transition(TaskStatus.FAILED)
-            self._broadcast_task_event(task.id, TaskStatus.FAILED)
-            await self._publish_status_update(
-                task.id,
-                TaskStatus.FAILED,
-                correlation_id=cid,
-            )
-            self._evict_task(task.id)
-            raise
-        finally:
-            current_task.reset(token)
+        async with self._tracing_scope() as stage:
+            token = current_task.set(task)
+            try:
+                result = await handler(task)
+            except Exception as exc:
+                if stage is not None:
+                    stage._finalize(status="failed", error=str(exc))
+                logger.exception("Handler %r raised an exception (async)", skill)
+                state.transition(TaskStatus.FAILED)
+                self._broadcast_task_event(task.id, TaskStatus.FAILED)
+                await self._publish_status_update(
+                    task.id,
+                    TaskStatus.FAILED,
+                    correlation_id=cid,
+                    duration_ms=stage.duration_ms if stage else None,
+                    trace_error="handler error",
+                )
+                self._evict_task(task.id)
+                return
+            except BaseException as exc:
+                if stage is not None:
+                    stage._finalize(status="failed", error=str(exc))
+                state.transition(TaskStatus.FAILED)
+                self._broadcast_task_event(task.id, TaskStatus.FAILED)
+                await self._publish_status_update(
+                    task.id,
+                    TaskStatus.FAILED,
+                    correlation_id=cid,
+                    duration_ms=stage.duration_ms if stage else None,
+                    trace_error="handler error",
+                )
+                self._evict_task(task.id)
+                raise
+            finally:
+                current_task.reset(token)
+
+        # Finalize trace on success.
+        if stage is not None:
+            stage._finalize(status="completed")
 
         # -- completed -------------------------------------------------------
         state.transition(TaskStatus.COMPLETED)
@@ -1018,6 +1104,7 @@ class AgentServer:
             TaskStatus.COMPLETED,
             correlation_id=cid,
             artifact=result,
+            duration_ms=stage.duration_ms if stage else None,
         )
         self._evict_task(task.id)
 
@@ -1106,6 +1193,12 @@ class AgentServer:
             )
         )
 
+        # Strip _trace from input — it's a reserved namespace used for
+        # trace propagation and must never reach handler code.  Use a
+        # shallow copy to preserve the HMAC-verified original dict.
+        if isinstance(task_input, dict):
+            task_input = {k: v for k, v in task_input.items() if k != "_trace"}
+
         # Build the Task object before the async/sync branch so both
         # paths can reference it.
         escrow = _ArtifactEscrow(
@@ -1152,73 +1245,92 @@ class AgentServer:
             )
         )
 
-        token = current_task.set(task)
-        try:
-            result = await matched_handler(task)
-        except Exception as exc:
-            # Detect rate-limit errors from upstream LLM providers and
-            # return 503 so the delivery worker backs off instead of
-            # immediately retrying (which amplifies the rate limit).
-            exc_cls = type(exc).__name__
-            is_rate_limit = "RateLimitError" in exc_cls or (
-                hasattr(exc, "status_code") and exc.status_code == 429
-            )
-            if is_rate_limit:
-                logger.warning(
-                    "Handler %r hit rate limit: %s",
-                    skill,
-                    exc,
+        async with self._tracing_scope() as stage:
+            token = current_task.set(task)
+            try:
+                result = await matched_handler(task)
+            except Exception as exc:
+                # Finalize trace on error before any early returns.
+                if stage is not None:
+                    stage._finalize(status="failed", error=str(exc))
+
+                # Detect rate-limit errors from upstream LLM providers and
+                # return 503 so the delivery worker backs off instead of
+                # immediately retrying (which amplifies the rate limit).
+                exc_cls = type(exc).__name__
+                is_rate_limit = "RateLimitError" in exc_cls or (
+                    hasattr(exc, "status_code") and exc.status_code == 429
                 )
-                retry_after = (
-                    getattr(exc, "headers", {}).get("retry-after", "60")
-                    if hasattr(exc, "headers")
-                    else "60"
-                )
-                # Clean up task state so a retry can re-create it
-                self._evict_task(task.id)
+                if is_rate_limit:
+                    logger.warning(
+                        "Handler %r hit rate limit: %s",
+                        skill,
+                        exc,
+                    )
+                    retry_after = (
+                        getattr(exc, "headers", {}).get("retry-after", "60")
+                        if hasattr(exc, "headers")
+                        else "60"
+                    )
+                    # Trace is finalized as "failed" above but we intentionally
+                    # don't publish a status pigeon here — the 503 tells the
+                    # delivery worker to retry, so this task will be re-created.
+                    self._evict_task(task.id)
+                    pending = self._pending_input.pop(task.id, None)
+                    if pending is not None and not pending.done():
+                        pending.cancel()
+                    return 503, {
+                        "id": task.id,
+                        "status": "rate_limited",
+                        "error": "rate limited",
+                        "_retry_after": str(retry_after),
+                    }
+
+                logger.exception("Handler %r raised an exception", skill)
+                # -- failed --------------------------------------------------
+                if not state.is_terminal:
+                    state.transition(TaskStatus.FAILED)
+                    self._broadcast_task_event(task.id, TaskStatus.FAILED)
+                    await self._publish_status_update(
+                        task.id,
+                        TaskStatus.FAILED,
+                        correlation_id=cid,
+                        duration_ms=stage.duration_ms if stage else None,
+                        trace_error="handler error",
+                    )
                 pending = self._pending_input.pop(task.id, None)
                 if pending is not None and not pending.done():
                     pending.cancel()
-                return 503, {
-                    "id": task.id,
-                    "status": "rate_limited",
-                    "error": str(exc),
-                    "_retry_after": str(retry_after),
-                }
+                self._evict_task(task.id)
+                return 500, {"id": task.id, "status": "failed", "error": "Internal handler error."}
+            except BaseException as exc:
+                # Finalize trace on BaseException (CancelledError, etc.).
+                if stage is not None:
+                    stage._finalize(status="failed", error=str(exc))
 
-            logger.exception("Handler %r raised an exception", skill)
-            # -- failed ------------------------------------------------------
-            if not state.is_terminal:
-                state.transition(TaskStatus.FAILED)
-                self._broadcast_task_event(task.id, TaskStatus.FAILED)
-                await self._publish_status_update(
-                    task.id,
-                    TaskStatus.FAILED,
-                    correlation_id=cid,
-                )
-            pending = self._pending_input.pop(task.id, None)
-            if pending is not None and not pending.done():
-                pending.cancel()
-            self._evict_task(task.id)
-            return 500, {"id": task.id, "status": "failed", "error": "Internal handler error."}
-        except BaseException:
-            # CancelledError, KeyboardInterrupt, etc. — still transition to
-            # FAILED so the state machine isn't left in WORKING, then re-raise.
-            if not state.is_terminal:
-                state.transition(TaskStatus.FAILED)
-                self._broadcast_task_event(task.id, TaskStatus.FAILED)
-                await self._publish_status_update(
-                    task.id,
-                    TaskStatus.FAILED,
-                    correlation_id=cid,
-                )
-            pending = self._pending_input.pop(task.id, None)
-            if pending is not None and not pending.done():
-                pending.cancel()
-            self._evict_task(task.id)
-            raise
-        finally:
-            current_task.reset(token)
+                # CancelledError, KeyboardInterrupt, etc. — still transition to
+                # FAILED so the state machine isn't left in WORKING, then re-raise.
+                if not state.is_terminal:
+                    state.transition(TaskStatus.FAILED)
+                    self._broadcast_task_event(task.id, TaskStatus.FAILED)
+                    await self._publish_status_update(
+                        task.id,
+                        TaskStatus.FAILED,
+                        correlation_id=cid,
+                        duration_ms=stage.duration_ms if stage else None,
+                        trace_error="handler error",
+                    )
+                pending = self._pending_input.pop(task.id, None)
+                if pending is not None and not pending.done():
+                    pending.cancel()
+                self._evict_task(task.id)
+                raise
+            finally:
+                current_task.reset(token)
+
+        # Finalize trace on success.
+        if stage is not None:
+            stage._finalize(status="completed")
 
         # -- completed -------------------------------------------------------
         state.transition(TaskStatus.COMPLETED)
@@ -1228,6 +1340,7 @@ class AgentServer:
             TaskStatus.COMPLETED,
             correlation_id=cid,
             artifact=result,
+            duration_ms=stage.duration_ms if stage else None,
         )
         # Evict terminal entry — the pigeon stream is the authoritative history.
         self._evict_task(task.id)

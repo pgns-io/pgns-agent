@@ -21,9 +21,10 @@ import pytest
 from starlette.testclient import TestClient
 
 from pgns_agent import AgentServer, Task, TaskStatus
-from pgns_agent._context import current_task
+from pgns_agent._context import _current_trace, current_task
 from pgns_agent._server import DEFAULT_HANDLER_NAME
 from pgns_agent._state import TaskState
+from pgns_agent._trace import _StageHandle
 
 # ---------------------------------------------------------------------------
 # Constructor
@@ -1946,3 +1947,591 @@ class TestA2AMessageEndpoint:
             headers={"Content-Type": "application/json"},
         )
         assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Tracing lifecycle
+# ---------------------------------------------------------------------------
+
+
+class TestTracingLifecycle:
+    """Verify _trace stripping, _StageHandle creation, and pigeon enrichment."""
+
+    def test_trace_key_stripped_from_input(self) -> None:
+        """_trace is stripped unconditionally, even when tracing=False."""
+        agent = AgentServer("a", "b")
+        received_input: list[Any] = []
+
+        @agent.on_task
+        async def handle(task: Task) -> dict[str, str]:
+            received_input.append(task.input)
+            return {"ok": True}
+
+        client = TestClient(agent.app())
+        resp = client.post(
+            "/",
+            json={"id": "t1", "input": {"query": "hello", "_trace": {"trace_id": "abc"}}},
+        )
+        assert resp.status_code == 200
+        assert received_input[0] == {"query": "hello"}
+
+    def test_trace_key_stripped_when_tracing_enabled(self) -> None:
+        agent = AgentServer("a", "b", tracing=True)
+        received_input: list[Any] = []
+
+        @agent.on_task
+        async def handle(task: Task) -> dict[str, str]:
+            received_input.append(task.input)
+            return {"ok": True}
+
+        client = TestClient(agent.app())
+        resp = client.post(
+            "/",
+            json={"id": "t1", "input": {"query": "hello", "_trace": {"trace_id": "abc"}}},
+        )
+        assert resp.status_code == 200
+        assert "_trace" not in received_input[0]
+
+    def test_non_dict_input_passes_through(self) -> None:
+        """Non-dict input (e.g. a string) is not modified by _trace stripping."""
+        agent = AgentServer("a", "b")
+        received_input: list[Any] = []
+
+        @agent.on_task
+        async def handle(task: Task) -> dict[str, str]:
+            received_input.append(task.input)
+            return {"ok": True}
+
+        client = TestClient(agent.app())
+        resp = client.post("/", json={"id": "t1", "input": "just a string"})
+        assert resp.status_code == 200
+        assert received_input[0] == "just a string"
+
+    def test_trace_available_in_handler_when_enabled(self) -> None:
+        agent = AgentServer("a", "b", tracing=True)
+        trace_captured: list[Any] = []
+
+        @agent.on_task
+        async def handle(task: Task) -> dict[str, str]:
+            trace_captured.append(task.trace)
+            if task.trace:
+                task.trace.set_input_summary("test input")
+            return {"done": True}
+
+        client = TestClient(agent.app())
+        resp = client.post("/", json={"id": "t1", "input": "x"})
+        assert resp.status_code == 200
+        assert trace_captured[0] is not None
+        assert trace_captured[0].agent_name == "a"
+        assert trace_captured[0].input_summary == "test input"
+
+    def test_trace_none_when_tracing_disabled(self) -> None:
+        agent = AgentServer("a", "b", tracing=False)
+        trace_captured: list[Any] = []
+
+        @agent.on_task
+        async def handle(task: Task) -> dict[str, str]:
+            trace_captured.append(task.trace)
+            return {"done": True}
+
+        client = TestClient(agent.app())
+        resp = client.post("/", json={"id": "t1", "input": "x"})
+        assert resp.status_code == 200
+        assert trace_captured[0] is None
+
+    def test_trace_finalized_on_success(self) -> None:
+        agent = AgentServer("a", "b", tracing=True)
+        stage_ref: list[Any] = []
+
+        @agent.on_task
+        async def handle(task: Task) -> dict[str, str]:
+            stage_ref.append(task.trace)
+            return {"ok": True}
+
+        client = TestClient(agent.app())
+        resp = client.post("/", json={"id": "t1", "input": "x"})
+        assert resp.status_code == 200
+        stage = stage_ref[0]
+        assert stage.status == "completed"
+        assert stage.duration_ms is not None
+        assert stage.duration_ms >= 0
+        assert stage.error is None
+
+    def test_trace_finalized_on_failure(self) -> None:
+        agent = AgentServer("a", "b", tracing=True)
+        stage_ref: list[Any] = []
+
+        @agent.on_task
+        async def handle(task: Task) -> dict[str, str]:
+            stage_ref.append(task.trace)
+            raise ValueError("boom")
+
+        client = TestClient(agent.app(), raise_server_exceptions=False)
+        resp = client.post("/", json={"id": "t1", "input": "x"})
+        assert resp.status_code == 500
+        stage = stage_ref[0]
+        assert stage.status == "failed"
+        assert stage.error == "boom"
+        assert stage.duration_ms is not None
+
+    def test_trace_context_var_reset_after_handler(self) -> None:
+        """_current_trace is reset after handler completes — no leaks."""
+
+        agent = AgentServer("a", "b", tracing=True)
+
+        @agent.on_task
+        async def handle(task: Task) -> dict[str, str]:
+            return {"ok": True}
+
+        client = TestClient(agent.app())
+        client.post("/", json={"id": "t1", "input": "x"})
+        assert _current_trace.get() is None
+
+    def test_trace_context_var_reset_on_error(self) -> None:
+        """_current_trace is reset even when handler raises."""
+
+        agent = AgentServer("a", "b", tracing=True)
+
+        @agent.on_task
+        async def handle(task: Task) -> dict[str, str]:
+            raise RuntimeError("oops")
+
+        client = TestClient(agent.app(), raise_server_exceptions=False)
+        client.post("/", json={"id": "t1", "input": "x"})
+        assert _current_trace.get() is None
+
+    def test_tracing_property(self) -> None:
+        assert AgentServer("a", "b").tracing is False
+        assert AgentServer("a", "b", tracing=True).tracing is True
+
+
+class TestTracingScope:
+    """Verify _tracing_scope context manager."""
+
+    def test_scope_yields_none_when_tracing_disabled(self) -> None:
+        agent = AgentServer("a", "b", tracing=False)
+
+        async def _run() -> None:
+            async with agent._tracing_scope() as stage:
+                assert stage is None
+
+        asyncio.get_event_loop().run_until_complete(_run())
+
+    def test_scope_yields_stage_when_tracing_enabled(self) -> None:
+        agent = AgentServer("a", "b", tracing=True)
+
+        async def _run() -> None:
+            async with agent._tracing_scope() as stage:
+                assert stage is not None
+                assert isinstance(stage, _StageHandle)
+                assert stage.agent_name == "a"
+
+        asyncio.get_event_loop().run_until_complete(_run())
+
+    def test_scope_resets_context_var_after_exit(self) -> None:
+        agent = AgentServer("a", "b", tracing=True)
+
+        async def _run() -> None:
+            async with agent._tracing_scope() as stage:
+                assert _current_trace.get() is stage
+            assert _current_trace.get() is None
+
+        asyncio.get_event_loop().run_until_complete(_run())
+
+
+# ---------------------------------------------------------------------------
+# Async dispatch tracing
+# ---------------------------------------------------------------------------
+
+
+class TestAsyncDispatchTracing:
+    """Verify tracing lifecycle on the async (Prefer: respond-async) path."""
+
+    def test_async_trace_finalized_on_success(self) -> None:
+        agent = AgentServer("a", "b", tracing=True)
+        stage_ref: list[Any] = []
+
+        @agent.on_task
+        async def handle(task: Task) -> dict[str, str]:
+            stage_ref.append(task.trace)
+            return {"ok": True}
+
+        client = TestClient(agent.app())
+        resp = client.post(
+            "/",
+            json={"id": "t1", "input": "x"},
+            headers={"Prefer": "respond-async"},
+        )
+        assert resp.status_code == 202
+        # Allow background task to complete.
+        time.sleep(0.1)
+        assert len(stage_ref) == 1
+        stage = stage_ref[0]
+        assert stage.status == "completed"
+        assert stage.duration_ms is not None
+        assert stage.duration_ms >= 0
+        assert stage.error is None
+
+    def test_async_trace_finalized_on_failure(self) -> None:
+        agent = AgentServer("a", "b", tracing=True)
+        stage_ref: list[Any] = []
+
+        @agent.on_task
+        async def handle(task: Task) -> dict[str, str]:
+            stage_ref.append(task.trace)
+            raise ValueError("async boom")
+
+        client = TestClient(agent.app(), raise_server_exceptions=False)
+        resp = client.post(
+            "/",
+            json={"id": "t1", "input": "x"},
+            headers={"Prefer": "respond-async"},
+        )
+        assert resp.status_code == 202
+        time.sleep(0.1)
+        assert len(stage_ref) == 1
+        stage = stage_ref[0]
+        assert stage.status == "failed"
+        assert stage.error == "async boom"
+        assert stage.duration_ms is not None
+
+    def test_async_trace_context_var_reset(self) -> None:
+        """_current_trace is reset after async handler completes."""
+        agent = AgentServer("a", "b", tracing=True)
+
+        @agent.on_task
+        async def handle(task: Task) -> dict[str, str]:
+            assert _current_trace.get() is not None
+            return {"ok": True}
+
+        client = TestClient(agent.app())
+        client.post(
+            "/",
+            json={"id": "t1", "input": "x"},
+            headers={"Prefer": "respond-async"},
+        )
+        time.sleep(0.1)
+        assert _current_trace.get() is None
+
+    def test_async_trace_none_when_tracing_disabled(self) -> None:
+        agent = AgentServer("a", "b", tracing=False)
+        trace_captured: list[Any] = []
+
+        @agent.on_task
+        async def handle(task: Task) -> dict[str, str]:
+            trace_captured.append(task.trace)
+            return {"done": True}
+
+        client = TestClient(agent.app())
+        client.post(
+            "/",
+            json={"id": "t1", "input": "x"},
+            headers={"Prefer": "respond-async"},
+        )
+        time.sleep(0.1)
+        assert len(trace_captured) == 1
+        assert trace_captured[0] is None
+
+
+# ---------------------------------------------------------------------------
+# Status pigeon tracing enrichment
+# ---------------------------------------------------------------------------
+
+
+class TestStatusPigeonTracing:
+    """Verify that status pigeons include/exclude duration_ms based on tracing setting."""
+
+    def test_completed_pigeon_includes_duration_ms_when_tracing_enabled(self) -> None:
+        with patch("pgns.sdk.async_client.AsyncPigeonsClient") as mock_cls:
+            mock_client = AsyncMock()
+            mock_cls.return_value = mock_client
+            mock_client.send = AsyncMock(
+                return_value=AsyncMock(id="pig-1", status="accepted", destinations=1)
+            )
+
+            agent = AgentServer("a", "b", pgns_key="pk_test", tracing=True)
+            roost = MagicMock()
+            roost.id = "roost-1"
+            roost.secret = "whsec_dGVzdA=="
+            agent._roost = roost  # noqa: SLF001
+            agent._provisioned = True  # noqa: SLF001
+
+            @agent.on_task
+            async def handle(task: Task) -> dict[str, Any]:
+                return {"done": True}
+
+            client = TestClient(agent.app())
+            client.post("/", json={"id": "t-trace-dur", "input": "x"})
+
+            # Find the completed status pigeon
+            completed_calls = [
+                c
+                for c in mock_client.send.await_args_list
+                if c.kwargs["payload"]["status"] == "completed"
+            ]
+            assert len(completed_calls) == 1
+            payload = completed_calls[0].kwargs["payload"]
+            assert "duration_ms" in payload
+            assert payload["duration_ms"] >= 0
+
+    def test_failed_pigeon_includes_duration_ms_and_trace_error(self) -> None:
+        with patch("pgns.sdk.async_client.AsyncPigeonsClient") as mock_cls:
+            mock_client = AsyncMock()
+            mock_cls.return_value = mock_client
+            mock_client.send = AsyncMock(
+                return_value=AsyncMock(id="pig-1", status="accepted", destinations=1)
+            )
+
+            agent = AgentServer("a", "b", pgns_key="pk_test", tracing=True)
+            roost = MagicMock()
+            roost.id = "roost-1"
+            roost.secret = "whsec_dGVzdA=="
+            agent._roost = roost  # noqa: SLF001
+            agent._provisioned = True  # noqa: SLF001
+
+            @agent.on_task
+            async def handle(task: Task) -> dict[str, str]:
+                raise RuntimeError("handler error")
+
+            client = TestClient(agent.app(), raise_server_exceptions=False)
+            client.post("/", json={"id": "t-trace-fail", "input": "x"})
+
+            failed_calls = [
+                c
+                for c in mock_client.send.await_args_list
+                if c.kwargs["payload"]["status"] == "failed"
+            ]
+            assert len(failed_calls) == 1
+            payload = failed_calls[0].kwargs["payload"]
+            assert "duration_ms" in payload
+            assert payload["duration_ms"] >= 0
+            assert payload["trace_error"] == "handler error"
+
+    def test_pigeon_no_duration_ms_when_tracing_disabled(self) -> None:
+        with patch("pgns.sdk.async_client.AsyncPigeonsClient") as mock_cls:
+            mock_client = AsyncMock()
+            mock_cls.return_value = mock_client
+            mock_client.send = AsyncMock(
+                return_value=AsyncMock(id="pig-1", status="accepted", destinations=1)
+            )
+
+            agent = AgentServer("a", "b", pgns_key="pk_test", tracing=False)
+            roost = MagicMock()
+            roost.id = "roost-1"
+            roost.secret = "whsec_dGVzdA=="
+            agent._roost = roost  # noqa: SLF001
+            agent._provisioned = True  # noqa: SLF001
+
+            @agent.on_task
+            async def handle(task: Task) -> dict[str, Any]:
+                return {"done": True}
+
+            client = TestClient(agent.app())
+            client.post("/", json={"id": "t-no-trace", "input": "x"})
+
+            assert len(mock_client.send.await_args_list) >= 1
+            for call in mock_client.send.await_args_list:
+                payload = call.kwargs["payload"]
+                assert "duration_ms" not in payload
+                assert "trace_error" not in payload
+
+
+# ---------------------------------------------------------------------------
+# Multi-agent pipeline simulation
+# ---------------------------------------------------------------------------
+
+
+class TestMultiAgentTracePipeline:
+    """Simulate chaining agents and verify trace accumulates across hops."""
+
+    def test_trace_accumulates_across_two_hops(self) -> None:
+        """Agent A → Agent B: B receives A's trace stage and sees accumulated data."""
+        # --- Agent A (tracing enabled) ---
+        agent_a = AgentServer("agent-a", "first in chain", tracing=True)
+        captured_trace_a: list[Any] = []
+
+        @agent_a.on_task
+        async def handle_a(task: Task) -> dict[str, str]:
+            assert task.trace is not None
+            task.trace.set_input_summary("user query")
+            task.trace.set_output_summary("processed by A")
+            captured_trace_a.append(task.trace)
+            return {"result": "from-a"}
+
+        client_a = TestClient(agent_a.app())
+        resp_a = client_a.post("/", json={"id": "t-hop1", "input": {"query": "hello"}})
+        assert resp_a.status_code == 200
+
+        # Build the payload that agent A would have sent downstream,
+        # including its finalized trace stage.
+        stage_a = captured_trace_a[0]
+        assert stage_a.status == "completed"
+        downstream_payload = {
+            "query": "hello",
+            "_trace": [stage_a._to_wire()],  # noqa: SLF001
+        }
+
+        # --- Agent B (tracing enabled, receives A's trace) ---
+        agent_b = AgentServer("agent-b", "second in chain", tracing=True)
+        received_input_b: list[Any] = []
+        captured_trace_b: list[Any] = []
+
+        @agent_b.on_task
+        async def handle_b(task: Task) -> dict[str, str]:
+            received_input_b.append(task.input)
+            assert task.trace is not None
+            task.trace.set_input_summary("from agent-a")
+            captured_trace_b.append(task.trace)
+            return {"result": "from-b"}
+
+        client_b = TestClient(agent_b.app())
+        resp_b = client_b.post("/", json={"id": "t-hop2", "input": downstream_payload})
+        assert resp_b.status_code == 200
+
+        # _trace is stripped from input before handler sees it
+        assert "_trace" not in received_input_b[0]
+        assert received_input_b[0] == {"query": "hello"}
+
+        # Agent B's own trace stage is independent
+        stage_b = captured_trace_b[0]
+        assert stage_b.agent_name == "agent-b"
+        assert stage_b.status == "completed"
+        assert stage_b.input_summary == "from agent-a"
+
+    def test_three_agent_chain_accumulates_all_stages(self) -> None:
+        """A → B → C: by the time C receives the payload, _trace has 2 stages."""
+        # --- Agent A ---
+        agent_a = AgentServer("agent-a", "first", tracing=True)
+        stage_ref_a: list[Any] = []
+
+        @agent_a.on_task
+        async def handle_a(task: Task) -> dict[str, str]:
+            assert task.trace is not None
+            task.trace.set_metadata({"hop": 1})
+            stage_ref_a.append(task.trace)
+            return {"from": "a"}
+
+        TestClient(agent_a.app()).post("/", json={"id": "t1", "input": {"q": "hi"}})
+        wire_a = stage_ref_a[0]._to_wire()  # noqa: SLF001
+
+        # --- Agent B ---
+        agent_b = AgentServer("agent-b", "second", tracing=True)
+        stage_ref_b: list[Any] = []
+
+        @agent_b.on_task
+        async def handle_b(task: Task) -> dict[str, str]:
+            assert task.trace is not None
+            task.trace.set_metadata({"hop": 2})
+            stage_ref_b.append(task.trace)
+            return {"from": "b"}
+
+        # B receives A's trace
+        payload_to_b = {"q": "hi", "_trace": [wire_a]}
+        TestClient(agent_b.app()).post("/", json={"id": "t2", "input": payload_to_b})
+        wire_b = stage_ref_b[0]._to_wire()  # noqa: SLF001
+
+        # Build accumulated trace: A's stage + B's stage
+        accumulated_trace = [wire_a, wire_b]
+
+        # --- Agent C ---
+        agent_c = AgentServer("agent-c", "third", tracing=True)
+        received_c: list[Any] = []
+
+        @agent_c.on_task
+        async def handle_c(task: Task) -> dict[str, str]:
+            received_c.append(task.input)
+            assert task.trace is not None
+            task.trace.set_metadata({"hop": 3})
+            return {"from": "c"}
+
+        # C receives both A and B stages
+        payload_to_c = {"q": "hi", "_trace": accumulated_trace}
+        resp = TestClient(agent_c.app()).post(
+            "/",
+            json={"id": "t3", "input": payload_to_c},
+        )
+        assert resp.status_code == 200
+
+        # _trace stripped — handler sees clean input
+        assert "_trace" not in received_c[0]
+        assert received_c[0] == {"q": "hi"}
+
+        # Verify each stage in the accumulated trace
+        assert len(accumulated_trace) == 2
+        assert accumulated_trace[0]["agent_name"] == "agent-a"
+        assert accumulated_trace[0]["metadata"] == {"hop": 1}
+        assert accumulated_trace[1]["agent_name"] == "agent-b"
+        assert accumulated_trace[1]["metadata"] == {"hop": 2}
+        assert accumulated_trace[0]["status"] == "completed"
+        assert accumulated_trace[1]["status"] == "completed"
+
+    def test_correlation_id_and_trace_propagate_together(self) -> None:
+        """Correlation ID in metadata and _trace in input coexist correctly."""
+        agent = AgentServer("corr-agent", "tests correlation", tracing=True)
+        captured: dict[str, Any] = {}
+
+        @agent.on_task
+        async def handle(task: Task) -> dict[str, str]:
+            captured["input"] = task.input
+            captured["trace"] = task.trace
+            captured["metadata"] = task.metadata
+            return {"ok": True}
+
+        upstream_trace = [{"v": 1, "agent_name": "upstream", "status": "completed"}]
+        client = TestClient(agent.app())
+        resp = client.post(
+            "/",
+            json={
+                "id": "t-corr",
+                "input": {"msg": "hello", "_trace": upstream_trace},
+                "metadata": {"correlation_id": "corr-abc-123"},
+            },
+        )
+        assert resp.status_code == 200
+
+        # _trace stripped from input
+        assert "_trace" not in captured["input"]
+        assert captured["input"] == {"msg": "hello"}
+
+        # Trace handle was created (tracing=True)
+        assert captured["trace"] is not None
+        assert captured["trace"].agent_name == "corr-agent"
+
+        # Correlation ID preserved in metadata
+        assert captured["metadata"].correlation_id == "corr-abc-123"
+
+    def test_correlation_id_and_trace_via_pigeon_delivery(self) -> None:
+        """Pigeon delivery mode: x-correlation-id header + _trace in body coexist."""
+        agent = AgentServer("corr-agent", "tests correlation", tracing=True)
+        captured: dict[str, Any] = {}
+
+        @agent.on_task
+        async def handle(task: Task) -> dict[str, str]:
+            captured["input"] = task.input
+            captured["trace"] = task.trace
+            captured["metadata"] = task.metadata
+            return {"ok": True}
+
+        # Pigeon delivery mode: no "id" in body, pigeon-id in header
+        upstream_trace = [{"v": 1, "agent_name": "upstream", "status": "completed"}]
+        client = TestClient(agent.app())
+        resp = client.post(
+            "/",
+            json={"msg": "hello", "_trace": upstream_trace},
+            headers={
+                "x-pigeon-id": "pig-123",
+                "x-correlation-id": "corr-abc-123",
+            },
+        )
+        assert resp.status_code == 200
+
+        # _trace stripped from input
+        assert "_trace" not in captured["input"]
+        assert captured["input"] == {"msg": "hello"}
+
+        # Trace handle was created (tracing=True)
+        assert captured["trace"] is not None
+        assert captured["trace"].agent_name == "corr-agent"
+
+        # Correlation ID from header preserved in metadata
+        assert captured["metadata"].correlation_id == "corr-abc-123"

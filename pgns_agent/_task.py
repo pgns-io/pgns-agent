@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from pgns_agent._artifact import ArtifactRef
+    from pgns_agent._trace import _StageHandle
 
 
 class TaskStatus(enum.StrEnum):
@@ -87,6 +88,28 @@ class Task:
     _ctrl: _TaskControl | None = dataclasses.field(
         default=None, repr=False, compare=False, hash=False
     )
+
+    @property
+    def trace(self) -> _StageHandle | None:
+        """The trace handle for the current handler invocation, or ``None``.
+
+        Returns ``None`` when tracing is disabled or when accessed outside a
+        handler.  The handle is set via a context var, so the ``Task`` dataclass
+        stays frozen::
+
+            @agent.on_task
+            async def handle(task):
+                if task.trace:
+                    task.trace.set_input_summary("user query")
+                ...
+
+        Note: The trace is scoped to the current handler invocation context,
+        not to this particular ``Task`` instance.
+        """
+        # Deferred to avoid circular import: _context imports Task
+        from pgns_agent._context import _current_trace
+
+        return _current_trace.get()
 
     async def update_status(self, message: str) -> None:
         """Publish a progress-update pigeon while staying in *working* state.
