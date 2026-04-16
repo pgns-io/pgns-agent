@@ -612,13 +612,16 @@ class AgentServer:
         async def _adapter_handler(task: Task) -> Any:
             task_input = task.input if task.input is not None else {}
             result_or_iter: Any = adapter.handle(task_input)
-            # Async generator → iterate; regular coroutine → await.
+            # handle() may be a coroutine (returns dict or async gen)
+            # or an async generator function (returns async gen directly).
+            if inspect.isawaitable(result_or_iter):
+                result_or_iter = await result_or_iter
             if inspect.isasyncgen(result_or_iter):
                 last: dict[str, Any] | None = None
                 async for chunk in result_or_iter:
                     last = chunk
                 return last
-            return await result_or_iter
+            return result_or_iter
 
         self._register_handler(handler_name, _adapter_handler)
         logger.debug(
@@ -676,20 +679,20 @@ class AgentServer:
     # -- Provisioning ---------------------------------------------------------
 
     async def provision(self) -> None:
-        """Auto-provision an AgentCard and Roost on the pgns relay.
+        """Auto-provision an AgentCard on the pgns relay.
 
-        In **local dev mode** (no *pgns_key*) this is a no-op — the server
+        In **local dev mode** (no *pgns_key*) this is a no-op -- the server
         simply logs that it is running locally.
 
         When a *pgns_key* is present:
 
         1. List existing agent cards and look for one matching :attr:`name`.
-           Create a new card if none is found.
-        2. List existing roosts and look for one whose ``agent_card_id`` matches
-           the card from step 1.  Create a new roost if none is found.
-        3. Store the roost secret for HMAC verification of incoming webhooks.
+           Create a new card if none is found.  The server auto-creates a
+           backing roost for every new agent card.
+        2. Fetch the backing roost by name and store its secret for HMAC
+           verification of incoming webhooks.
 
-        This method is idempotent — calling it multiple times is safe.
+        This method is idempotent -- calling it multiple times is safe.
         """
         if self._provisioned:
             return
@@ -701,12 +704,12 @@ class AgentServer:
 
             if self._client is None:
                 logger.info(
-                    "Local dev mode — skipping provisioning for %r (no pgns_key)", self._name
+                    "Local dev mode -- skipping provisioning for %r (no pgns_key)", self._name
                 )
                 self._provisioned = True
                 return
 
-            from pgns.models import CreateAgentCard, CreateRoost
+            from pgns.models import CreateAgentCard
 
             client = self._client
 
@@ -733,22 +736,9 @@ class AgentServer:
 
             self._agent_card = agent_card
 
-            # -- Step 2: ensure Roost exists for this card --------------------
-            roosts = await client.list_roosts()
-            roost = next((r for r in roosts if r.agent_card_id == agent_card.id), None)
-
-            if roost is None:
-                roost = await client.create_roost(
-                    CreateRoost(
-                        name=f"{self._name}-inbox",
-                        description=f"Auto-provisioned inbox for agent {self._name!r}",
-                        agent_card_id=agent_card.id,
-                    )
-                )
-                logger.info("Created roost %s (%s)", roost.name, roost.id)
-            else:
-                logger.info("Found existing roost %s (%s)", roost.name, roost.id)
-
+            # -- Step 2: fetch backing roost (auto-created by server) ---------
+            roost = await client.get_roost_by_name(f"{self._name}-inbox")
+            logger.info("Found backing roost %s (%s)", roost.name, roost.id)
             self._roost = roost
 
             # -- Step 3: initialise webhook verifier from roost secret --------
@@ -759,7 +749,7 @@ class AgentServer:
                 logger.debug("HMAC verification enabled for roost %s", roost.id)
             else:
                 logger.warning(
-                    "Roost %s has no secret — webhook verification is disabled", roost.id
+                    "Roost %s has no secret -- webhook verification is disabled", roost.id
                 )
 
             self._provisioned = True

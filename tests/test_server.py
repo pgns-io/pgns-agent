@@ -1164,8 +1164,7 @@ class TestProvision:
 
             mock_client.list_agents = AsyncMock(return_value=[])
             mock_client.create_agent = AsyncMock(return_value=card)
-            mock_client.list_roosts = AsyncMock(return_value=[])
-            mock_client.create_roost = AsyncMock(return_value=roost)
+            mock_client.get_roost_by_name = AsyncMock(return_value=roost)
 
             agent = AgentServer("my-agent", "Does things", pgns_key="pk_test_abc")
             await agent.provision()
@@ -1174,7 +1173,7 @@ class TestProvision:
             assert agent.agent_card is card
             assert agent.roost is roost
             mock_client.create_agent.assert_awaited_once()
-            mock_client.create_roost.assert_awaited_once()
+            mock_client.get_roost_by_name.assert_awaited_once_with("my-agent-inbox")
 
     @pytest.mark.asyncio
     async def test_finds_existing_agent_card_and_roost(self) -> None:
@@ -1186,7 +1185,7 @@ class TestProvision:
             roost = _mock_roost(agent_card_id=card.id)
 
             mock_client.list_agents = AsyncMock(return_value=[card])
-            mock_client.list_roosts = AsyncMock(return_value=[roost])
+            mock_client.get_roost_by_name = AsyncMock(return_value=roost)
 
             agent = AgentServer("my-agent", "Does things", pgns_key="pk_test_abc")
             await agent.provision()
@@ -1195,7 +1194,7 @@ class TestProvision:
             assert agent.agent_card is card
             assert agent.roost is roost
             mock_client.create_agent.assert_not_awaited()
-            mock_client.create_roost.assert_not_awaited()
+            mock_client.get_roost_by_name.assert_awaited_once_with("my-agent-inbox")
 
     @pytest.mark.asyncio
     async def test_finds_card_creates_roost(self) -> None:
@@ -1207,8 +1206,7 @@ class TestProvision:
             roost = _mock_roost(agent_card_id=card.id)
 
             mock_client.list_agents = AsyncMock(return_value=[card])
-            mock_client.list_roosts = AsyncMock(return_value=[])
-            mock_client.create_roost = AsyncMock(return_value=roost)
+            mock_client.get_roost_by_name = AsyncMock(return_value=roost)
 
             agent = AgentServer("my-agent", "Does things", pgns_key="pk_test_abc")
             await agent.provision()
@@ -1216,7 +1214,7 @@ class TestProvision:
             assert agent.agent_card is card
             assert agent.roost is roost
             mock_client.create_agent.assert_not_awaited()
-            mock_client.create_roost.assert_awaited_once()
+            mock_client.get_roost_by_name.assert_awaited_once_with("my-agent-inbox")
 
     @pytest.mark.asyncio
     async def test_roost_without_secret_skips_webhook(self) -> None:
@@ -1228,7 +1226,7 @@ class TestProvision:
             roost = _mock_roost(agent_card_id=card.id, secret=None)
 
             mock_client.list_agents = AsyncMock(return_value=[card])
-            mock_client.list_roosts = AsyncMock(return_value=[roost])
+            mock_client.get_roost_by_name = AsyncMock(return_value=roost)
 
             agent = AgentServer("my-agent", "Does things", pgns_key="pk_test_abc")
             await agent.provision()
@@ -1247,7 +1245,7 @@ class TestProvision:
             roost = _mock_roost(agent_card_id=card.id)
 
             mock_client.list_agents = AsyncMock(return_value=[card])
-            mock_client.list_roosts = AsyncMock(return_value=[roost])
+            mock_client.get_roost_by_name = AsyncMock(return_value=roost)
 
             agent = AgentServer("my-agent", "Does things", pgns_key="pk_test_abc")
             await agent.provision()
